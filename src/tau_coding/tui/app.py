@@ -3977,7 +3977,7 @@ class TauTuiApp(App[None]):
 
     #prompt-row {
         height: auto;
-        margin: 0 1 1 1;
+        margin: 0 1 0 1;
     }
 
     #prompt-prefix {
@@ -3993,27 +3993,25 @@ class TauTuiApp(App[None]):
     #prompt {
         width: 1fr;
         height: auto;
-        background: $tau-prompt-background;
+        background: $tau-screen-background;
         color: $tau-prompt-text;
         border: none;
-        border-left: tall transparent;
+        border-top: solid $tau-prompt-border;
+        border-bottom: solid $tau-prompt-border;
         margin: 0;
-        padding: 1 1;
+        padding: 0 1;
         max-height: 8;
     }
 
-    #prompt:focus {
-        border-left: tall $tau-prompt-border;
-    }
-
     #prompt.-shell-mode {
-        border-left: tall $tau-tool-running;
+        border-top: solid $tau-tool-running;
+        border-bottom: solid $tau-tool-running;
     }
 
     #compact-session-info {
         height: auto;
         max-height: 3;
-        margin: 0 1 1 1;
+        margin: 0 1 0 1;
         padding: 0 1;
         color: $tau-muted-text;
     }
@@ -7682,15 +7680,14 @@ class TauTuiApp(App[None]):
         if render_key == self._last_activity_indicator_key:
             return
         self._last_activity_indicator_key = render_key
-        prompt.styles.border_left = (
-            "tall",
-            _activity_prompt_border_color(
-                theme,
-                frame=self._activity_frame,
-                running=self._is_working(),
-                shell_mode=shell_mode,
-            ),
+        border_color = _activity_prompt_border_color(
+            theme,
+            frame=self._activity_frame,
+            running=self._is_working(),
+            shell_mode=shell_mode,
         )
+        prompt.styles.border_top = ("solid", border_color)
+        prompt.styles.border_bottom = ("solid", border_color)
         prompt_prefix.update(
             _render_activity_indicator(
                 theme,

@@ -1036,13 +1036,12 @@ def test_compact_session_info_renders_sidebar_facts() -> None:
 
     output = console.export_text()
     lines = output.splitlines()
-    provider_line = next(index for index, line in enumerate(lines) if "openai:fake-model" in line)
-    context_line = next(index for index, line in enumerate(lines) if "12k/200k" in line)
-    assert "/workspace/project (--)" in output
+    assert len(lines) == 2
+    assert lines[0].strip() == "/workspace/project (--)"
+    assert lines[1].strip().startswith("openai:fake-model (medium)")
+    assert lines[1].rstrip().endswith("12k/200k")
+    assert len(lines[1].rstrip()) == 120
     assert "context 12k/200k" not in output
-    assert "openai:fake-model" in lines[provider_line]
-    assert "(medium)" in lines[provider_line]
-    assert context_line == provider_line + 1
 
 
 def test_compact_session_info_omits_unavailable_thinking_controls() -> None:
@@ -3448,6 +3447,16 @@ async def test_tui_prompt_grows_to_six_lines_then_scrolls() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_compact_session_info_sits_directly_below_prompt() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 30)):
+        prompt_row = app.query_one("#prompt-row")
+        compact_info = app.query_one("#compact-session-info")
+        assert compact_info.region.y == prompt_row.region.bottom
+
+
+@pytest.mark.anyio
 async def test_tui_sidebar_is_visible_on_medium_windows() -> None:
     app = TauTuiApp(FakeSession())
 
@@ -4535,10 +4544,10 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
 
         assert not app.query("#status")
         assert not app.query("#activity-status")
-        assert prompt.styles.border_left[1].hex.lower() == "#2d3748"
-        assert prompt.styles.border_top[0] == ""
+        assert prompt.styles.border_top == ("solid", Color.parse("#2d3748"))
+        assert prompt.styles.border_bottom == ("solid", Color.parse("#2d3748"))
+        assert prompt.styles.border_left[0] == ""
         assert prompt.styles.border_right[0] == ""
-        assert prompt.styles.border_bottom[0] == ""
         assert indicator.render().plain == "τ"
 
         app.adapter.apply(AgentStartEvent())
@@ -4546,19 +4555,19 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
 
         assert pytest.approx(tui_app.ACTIVITY_TICK_SECONDS) == 0.15
         assert tui_app.ACTIVITY_COLOR_FADE_STEPS == 24
-        assert prompt.styles.border_left[1].hex.lower() == "#2d3748"
+        assert prompt.styles.border_top[1].hex.lower() == "#2d3748"
         assert indicator.render().plain.startswith("■")
 
         app._tick_activity()
 
-        assert prompt.styles.border_left[1].hex.lower() == "#2d3748"
+        assert prompt.styles.border_top[1].hex.lower() == "#2d3748"
         assert indicator.render().plain.splitlines()[1] == "■"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
 
         assert not app.query("#status")
-        assert prompt.styles.border_left[1].hex.lower() == "#2d3748"
+        assert prompt.styles.border_top[1].hex.lower() == "#2d3748"
         assert indicator.render().plain == "τ"
 
 
@@ -4685,10 +4694,10 @@ async def test_tui_app_clears_activity_status_on_error() -> None:
 
         assert not app.query("#status")
         assert not app.query("#activity-status")
-        assert prompt.styles.border_left[1].hex.lower() == "#2d3748"
-        assert prompt.styles.border_top[0] == ""
+        assert prompt.styles.border_top == ("solid", Color.parse("#2d3748"))
+        assert prompt.styles.border_bottom == ("solid", Color.parse("#2d3748"))
+        assert prompt.styles.border_left[0] == ""
         assert prompt.styles.border_right[0] == ""
-        assert prompt.styles.border_bottom[0] == ""
         assert indicator.render().plain == "τ"
 
 
