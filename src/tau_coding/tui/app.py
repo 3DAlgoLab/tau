@@ -4633,7 +4633,7 @@ class TauTuiApp(App[None]):
         self._applying_settings_theme = False
         self._bindings = BindingsMap(_app_bindings(self.tui_settings.keybindings))
         self.session = session
-        self.state = TuiState(skills=session.skills)
+        self.state = TuiState(skills=session.skills, cwd=session.cwd)
         if startup_update_notice is not None:
             self.state.add_item("status", startup_update_notice, highlight="update")
         for alert in startup_alerts:

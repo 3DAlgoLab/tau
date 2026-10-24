@@ -1352,6 +1352,7 @@ async def run_print_mode(
     renderer = create_event_renderer(
         output,
         custom_message_renderer=session.extension_runtime.render_custom_message,
+        cwd=session.cwd,
     )
     try:
         terminal_command = parse_terminal_command(prompt)
