@@ -95,11 +95,13 @@ in the append-only session log and `/tree` can branch from any of them. Tau has 
 
 ## What is not here yet
 
-- QA probes generated from ground truth (Phase 1c).
 - A `carry-forward` entry type: the renderer already has the block, the entry
   model does not exist yet.
 - Wiring, provenance in `CompactionEntry.details`, and any UI affordance (Phase
   1d as an extension).
+
+The check that grades these folds landed in
+[Phase 1c](./compaction-qa-probes.md).
 
 ## How to test
 

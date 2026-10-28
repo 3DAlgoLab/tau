@@ -65,6 +65,16 @@ MAX_RESOLVED = MAX_OUTSTANDING - MAX_UNRESOLVED
 MAX_EARLIER_TURNS = 32
 TRANSCRIPT_WINDOW = 40
 
+#: Nouns used by addressed omission markers. QA asserts against these same
+#: strings, so a marker's phrasing lives in exactly one place.
+NOUN_REQUESTS = "user scope changes"
+NOUN_FILES = "file addresses"
+NOUN_ACTIVITY = "activity records"
+NOUN_UNRESOLVED = "open error records"
+NOUN_RESOLVED = "resolved error records"
+NOUN_EARLIER_TURNS = "earlier turns"
+NOUN_TRANSCRIPT = "transcript events"
+
 Outcome = Literal["succeeded", "failed"]
 
 
@@ -154,7 +164,7 @@ def quoted(text: str, max_bytes: int) -> str:
     return json.dumps(truncate(text, max_bytes), ensure_ascii=False)
 
 
-def _path_of(arguments: dict[str, JSONValue]) -> str | None:
+def path_of(arguments: dict[str, JSONValue]) -> str | None:
     for key in ("path", "file", "dir"):
         value = arguments.get(key)
         if isinstance(value, str) and value.strip():
@@ -162,7 +172,7 @@ def _path_of(arguments: dict[str, JSONValue]) -> str | None:
     return None
 
 
-def _command_of(arguments: dict[str, JSONValue]) -> str | None:
+def command_of(arguments: dict[str, JSONValue]) -> str | None:
     value = arguments.get("command")
     if isinstance(value, str) and value.strip():
         return value
@@ -285,7 +295,7 @@ def _project_requests(
                     sampled.omitted,
                     sampled.omitted_first_entry_id,
                     sampled.omitted_last_entry_id,
-                    "user scope changes",
+                    NOUN_REQUESTS,
                 )
             )
         line = truncate(first_line(user.text), MAX_USER_ONELINER_BYTES)
@@ -309,7 +319,7 @@ def _project_files(events: Sequence[CompactionEvent]) -> _Section:
     for operation in collect_operations(events):
         if not is_file_operation(operation) or operation.outcome != "succeeded":
             continue
-        path = _path_of(operation.arguments)
+        path = path_of(operation.arguments)
         if not path:
             continue
         address = _AddressedFile(path=path, entry_id=operation.entry_id)
@@ -350,7 +360,7 @@ def _project_files(events: Sequence[CompactionEvent]) -> _Section:
                         sampled.omitted,
                         sampled.omitted_first_entry_id,
                         sampled.omitted_last_entry_id,
-                        "file addresses",
+                        NOUN_FILES,
                     )
                 )
             lines.append(f"  {_strip_root(root, item.path)} [entry {item.entry_id}]")
@@ -399,7 +409,7 @@ def _project_activity(
                     sampled.omitted,
                     sampled.omitted_first_entry_id,
                     sampled.omitted_last_entry_id,
-                    "activity records",
+                    NOUN_ACTIVITY,
                 )
             )
         lines.append(f"{item.line} [entry {item.entry_id}]")
@@ -414,17 +424,58 @@ class _ErrorItem:
     resolved: bool
 
 
-def _identity_of(operation: Operation) -> str:
+def identity_of(operation: Operation) -> str:
     """Return the typed identity that lets a later success resolve a failure."""
     if is_file_operation(operation):
-        path = _path_of(operation.arguments)
+        path = path_of(operation.arguments)
         if path:
             return f"file\0{operation.tool}\0{path}"
     if is_bash_operation(operation):
-        command = _command_of(operation.arguments)
+        command = command_of(operation.arguments)
         if command is not None:
             return f"bash\0{operation.tool}\0{command}"
     return f"generic\0{operation.ref}\0{json.dumps(operation.arguments, sort_keys=True)}"
+
+
+def error_subject(operation: Operation) -> str:
+    """Return the addressed identity of a failed operation, never its prose."""
+    path = path_of(operation.arguments) if is_file_operation(operation) else None
+    command = command_of(operation.arguments) if is_bash_operation(operation) else None
+    if path:
+        return f"{operation.ref} {path}"
+    if command is not None:
+        return f"{operation.ref}: {truncate(first_line(command), MAX_LINE_BYTES)}"
+    return operation.ref
+
+
+def error_signature(operation: Operation) -> str:
+    """Return the first line of a failure, or its outcome when there is none."""
+    if operation.error:
+        return f": {truncate(first_line(operation.error), MAX_LINE_BYTES)}"
+    return f": {operation.outcome}"
+
+
+def unresolved_operations(events: Sequence[CompactionEvent]) -> list[Operation]:
+    """Return failed operations no later success has answered.
+
+    Resolution is decided by :func:`identity_of`, so a retry of the same command
+    or edit to the same path closes the earlier failure while unrelated work does
+    not. This is shared by the fold and by QA so the two can never disagree.
+    """
+    operations = collect_operations(events)
+    successes = [
+        (operation.index, identity_of(operation))
+        for operation in operations
+        if operation.outcome == "succeeded"
+    ]
+    return [
+        operation
+        for operation in operations
+        if operation.outcome != "succeeded"
+        and not any(
+            index > operation.index and key == identity_of(operation) for index, key in successes
+        )
+    ]
 
 
 def project_outstanding(events: Sequence[CompactionEvent]) -> _Section:
@@ -437,7 +488,7 @@ def project_outstanding(events: Sequence[CompactionEvent]) -> _Section:
     """
     operations = collect_operations(events)
     successes = [
-        (operation.index, _identity_of(operation))
+        (operation.index, identity_of(operation))
         for operation in operations
         if operation.outcome == "succeeded"
     ]
@@ -445,25 +496,13 @@ def project_outstanding(events: Sequence[CompactionEvent]) -> _Section:
     for operation in operations:
         if operation.outcome == "succeeded":
             continue
-        path = _path_of(operation.arguments) if is_file_operation(operation) else None
-        command = _command_of(operation.arguments) if is_bash_operation(operation) else None
-        if path:
-            subject = f"{operation.ref} {path}"
-        elif command is not None:
-            subject = f"{operation.ref}: {truncate(first_line(command), MAX_LINE_BYTES)}"
-        else:
-            subject = operation.ref
-        signature = (
-            f": {truncate(first_line(operation.error), MAX_LINE_BYTES)}"
-            if operation.error
-            else f": {operation.outcome}"
-        )
-        identity = _identity_of(operation)
+        description = f"{error_subject(operation)}{error_signature(operation)}"
+        identity = identity_of(operation)
         items.append(
             _ErrorItem(
                 index=operation.index,
                 entry_id=operation.entry_id,
-                description=f"{subject}{signature}",
+                description=description,
                 resolved=any(
                     index > operation.index and key == identity for index, key in successes
                 ),
@@ -490,19 +529,12 @@ def project_outstanding(events: Sequence[CompactionEvent]) -> _Section:
             marker = " [RESOLVED]" if item.resolved else ""
             lines.append(f"- {item.description}{marker} [entry {item.entry_id}]")
 
-    append(unresolved, "open error records")
-    append(resolved, "resolved error records")
+    append(unresolved, NOUN_UNRESOLVED)
+    append(resolved, NOUN_RESOLVED)
     return _Section(
         lines=tuple(lines),
         omitted=unresolved.omitted + resolved.omitted,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _Turn:
-    entry_id: str
-    context_line: str
-    tools: str
 
 
 def _turn_tool_name(event: CompactionEvent, call_ids: frozenset[str]) -> str | None:
@@ -533,53 +565,70 @@ def _custom_message_line(event: CustomMessageEvent, max_bytes: int) -> str:
     )
 
 
-def _project_earlier_turns(events: Sequence[CompactionEvent]) -> _Section:
+@dataclass(frozen=True, slots=True)
+class Turn:
+    """One turn collapsed to an addressed one-liner plus a tool histogram."""
+
+    entry_id: str
+    context_line: str
+    tools: str
+    is_user: bool
+
+
+def iter_turns(events: Sequence[CompactionEvent]) -> Iterable[Turn]:
+    """Yield one :class:`Turn` per user or extension-injected context.
+
+    The final context is not yielded: it is the turn the summary is answering,
+    which the dialogue fold already protects.
+    """
+    call_ids = frozenset(_calls_by_id(events))
+    context: UserEvent | CustomMessageEvent | None = None
+    counts: dict[str, int] = {}
+    order: list[str] = []
+
+    def completed() -> Turn | None:
+        if context is None:
+            return None
+        if isinstance(context, UserEvent):
+            is_user = True
+            context_line = quoted(first_line(context.text), MAX_EARLIER_USER_BYTES)
+        else:
+            is_user = False
+            context_line = _custom_message_line(context, MAX_EARLIER_USER_BYTES)
+        return Turn(
+            entry_id=context.entry_id,
+            context_line=context_line,
+            tools=" ".join(f"{name}:{counts[name]}" for name in order),
+            is_user=is_user,
+        )
+
+    for event in events:
+        if isinstance(event, (UserEvent, CustomMessageEvent)):
+            turn = completed()
+            if turn is not None:
+                yield turn
+            context = event
+            counts = {}
+            order = []
+            continue
+        if context is None:
+            continue
+        name = _turn_tool_name(event, call_ids)
+        if name is None:
+            continue
+        if name not in counts:
+            order.append(name)
+        counts[name] = counts.get(name, 0) + 1
+
+
+def project_earlier_turns(events: Sequence[CompactionEvent]) -> _Section:
     """Collapse every turn before the last to one addressed line.
 
     A turn is one user (or extension-injected) message plus the tool histogram
     that followed it. The histogram is computed from typed call names, so an old
     turn still says what was done there even when its prose is gone.
     """
-
-    def turns() -> Iterable[_Turn]:
-        call_ids = frozenset(_calls_by_id(events))
-        context: UserEvent | CustomMessageEvent | None = None
-        counts: dict[str, int] = {}
-        order: list[str] = []
-
-        def completed() -> _Turn | None:
-            if context is None:
-                return None
-            context_line = (
-                quoted(first_line(context.text), MAX_EARLIER_USER_BYTES)
-                if isinstance(context, UserEvent)
-                else _custom_message_line(context, MAX_EARLIER_USER_BYTES)
-            )
-            return _Turn(
-                entry_id=context.entry_id,
-                context_line=context_line,
-                tools=" ".join(f"{name}:{counts[name]}" for name in order),
-            )
-
-        for event in events:
-            if isinstance(event, (UserEvent, CustomMessageEvent)):
-                turn = completed()
-                if turn is not None:
-                    yield turn
-                context = event
-                counts = {}
-                order = []
-                continue
-            if context is None:
-                continue
-            name = _turn_tool_name(event, call_ids)
-            if name is None:
-                continue
-            if name not in counts:
-                order.append(name)
-            counts[name] = counts.get(name, 0) + 1
-
-    sampled = sample_addressed_from(turns(), MAX_EARLIER_TURNS)
+    sampled = sample_addressed_from(iter_turns(events), MAX_EARLIER_TURNS)
     lines: list[str] = []
     for position, turn in enumerate(sampled.values):
         if sampled.omitted and position == sampled.split_index:
@@ -588,7 +637,7 @@ def _project_earlier_turns(events: Sequence[CompactionEvent]) -> _Section:
                     sampled.omitted,
                     sampled.omitted_first_entry_id,
                     sampled.omitted_last_entry_id,
-                    "earlier turns",
+                    NOUN_EARLIER_TURNS,
                 )
             )
         lines.append(
@@ -633,10 +682,10 @@ def _project_status(events: Sequence[CompactionEvent]) -> _Section:
         elif is_bash_operation(operation):
             last_command = operation
     if last_change is not None:
-        path = _path_of(last_change.arguments) or ""
+        path = path_of(last_change.arguments) or ""
         lines.append(f"Last change: {last_change.tool}{f' {path}' if path else ''}")
     if last_command is not None:
-        command = _command_of(last_command.arguments)
+        command = command_of(last_command.arguments)
         detail = f" {truncate(first_line(command), MAX_STATUS_LINE_BYTES)}" if command else ""
         lines.append(f"Last command: {last_command.ref}{detail} -> {last_command.outcome}")
 
@@ -652,7 +701,7 @@ def _project_status(events: Sequence[CompactionEvent]) -> _Section:
 def _summarize_args(name: str, arguments: dict[str, JSONValue]) -> str:
     """Render the identifying argument set for a transcript line."""
     primary = (
-        _command_of(arguments) if name == "bash" else _path_of(arguments) or _primary_of(arguments)
+        command_of(arguments) if name == "bash" else path_of(arguments) or _primary_of(arguments)
     )
     if primary:
         return truncate(first_line(primary), MAX_TRANSCRIPT_CMD_BYTES)
@@ -680,7 +729,7 @@ def _project_transcript(events: Sequence[CompactionEvent]) -> _Section:
                 omitted,
                 events[0].entry_id if events else None,
                 events[omitted - 1].entry_id,
-                "transcript events",
+                NOUN_TRANSCRIPT,
             )
         )
     for event in window:
@@ -726,7 +775,7 @@ def project_with_metadata(
     files = _project_files(events)
     activity = _project_activity(events)
     outstanding = project_outstanding(events)
-    earlier_turns = _project_earlier_turns(events)
+    earlier_turns = project_earlier_turns(events)
     status = _project_status(events)
     transcript = _project_transcript(events)
     return ProjectionResult(
