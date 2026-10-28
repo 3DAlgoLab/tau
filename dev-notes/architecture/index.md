@@ -69,6 +69,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [Deterministic Compaction Core (bounds, events, cut)](./compaction-engine-core.md)
 - [Deterministic Compaction Folds And Renderer](./compaction-folds-and-renderer.md)
 - [Deterministic Compaction QA Probes](./compaction-qa-probes.md)
+- [Deterministic Compaction As An Extension](./compaction-engine-extension.md)
 
 Phase 21 extensions are implemented; see the phase note and the user guide at
 `website/content/guides/extensions.md`.

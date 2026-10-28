@@ -742,6 +742,27 @@ def setup(tau):
 Whatever `details` you return is persisted on the compaction entry, so a later
 run can tell which engine produced the summary and expand what it omitted.
 
+Tau ships one complete engine: `examples/extensions/deterministic_compaction.py`.
+Copy it into `~/.tau/extensions/` to stop paying for summarizer requests. It is
+deliberately conservative:
+
+- structure, not prose — decisions come from roles, content block types, tool
+  names, JSON arguments, and error flags, so the same entries compile to the same
+  bytes and no classifier is quietly guessing at intent;
+- thinking is erased and counted, never paraphrased back into context;
+- every omission is a counted marker addressed by the source entries it covers,
+  and the whole summary is byte-bounded before the next request is built;
+- the summary is checked against ground-truth probes generated from the entries
+  the cut dropped. If one fails, the engine returns `action="continue"` and
+  Tau's summarizer runs as usual, so an engine bug degrades to the old behavior
+  rather than to a silent loss;
+- provenance lands on the compaction entry: engine version, entry counts, erased
+  thinking blocks, summary bytes, per-section omissions, QA scores, and the cut
+  budget that chose the boundary.
+
+`/compact-engine` reports the last decision — `replace`, `no_cut`, `empty_window`,
+or `qa_failed` with the failed probes — without opening the session log.
+
 All other handler failures are contained: they are recorded as diagnostics
 (visible in `/session`) and never crash the session.
 
@@ -859,6 +880,7 @@ runtime only sees the former.
 See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/examples/extensions):
 
 - **`ask_user_question.py`** — lets the agent ask one multiple-choice question through the host UI.
+- **`deterministic_compaction.py`** — replaces the summarizer request with a byte-stable, QA-checked summary built on `tau_coding.compaction`.
 - **`hello_tool.py`** — minimal custom tool.
 - **`permission_gate.py`** — blocks dangerous bash commands with the
   `tool_call` hook.

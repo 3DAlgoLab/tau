@@ -82,3 +82,9 @@ footer failing only the address score, an unresolved error requiring its
 signature while a resolved one does not, addressed markers surviving a file
 storm, CJK requests and CJK error text surviving the byte ceilings, and an empty
 window producing no probes.
+
+## Next
+
+[Deterministic Compaction As An Extension](./compaction-engine-extension.md)
+puts this gate in the product path: the engine writes a summary only when
+`qa_report(...).ok`, and declines to Tau's summarizer when it does not.
