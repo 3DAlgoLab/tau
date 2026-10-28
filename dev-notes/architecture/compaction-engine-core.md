@@ -89,12 +89,13 @@ own reading is used, so calibration degrades to `scale = 1` rather than guessing
 
 ## What is not here yet
 
-- Rendering: the bounded section renderer and projections (dialogue, requests,
-  files, errors, earlier turns, current status, transcript pointers).
 - QA: structural probes generated from ground-truth events, not from rendered
   text.
 - Wiring: a built-in engine selector, and filling `CompactionEntry.details` with
   engine provenance for expand-on-demand.
+
+Rendering and the section folds that consume these events landed next in
+[Phase 1b](./compaction-folds-and-renderer.md).
 
 ## How to test
 

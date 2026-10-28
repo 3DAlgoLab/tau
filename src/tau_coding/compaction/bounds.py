@@ -104,9 +104,15 @@ def canonicalize_text(text: str, max_bytes: int = MAX_REQUEST_SOURCE_BYTES) -> C
 
 
 class Addressed(Protocol):
-    """A sampled item that can be named by the session entry it came from."""
+    """A sampled item that can be named by the session entry it came from.
 
-    entry_id: str
+    Declared as a read-only property so frozen dataclasses satisfy it: the
+    samplers only ever read the address, and a settable protocol member would
+    exclude exactly the immutable value types the folds build.
+    """
+
+    @property
+    def entry_id(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
