@@ -9,9 +9,9 @@ says otherwise.
 
 ```text
 src/tau_agent/session/entries.py        CompactionEntry.details
-src/tau_coding/extensions/api.py        BeforeCompactEvent, CompactHookResult, "before_compact"
+src/tau_coding/extensions/api.py        BeforeCompactEvent, CompactionContextEntry, CompactHookResult, "before_compact"
 src/tau_coding/extensions/runtime.py    run_before_compact_hooks(), CompactHookOutcome
-src/tau_coding/session.py               _run_before_compact_hooks(), _resolve_compaction_summary()
+src/tau_coding/session.py               CompactionPlan.context_rows, _run_before_compact_hooks(), _resolve_compaction_summary()
 ```
 
 `before_compact` joins the lifecycle hook set alongside `input`, `tool_call`,
@@ -41,11 +41,39 @@ Skipping the summarizer call is the point. Tau's current `/compact` spends a ful
 provider round trip, which makes compaction slow and makes it expensive for
 child agents to compact. A deterministic engine needs neither.
 
+## Why the payload carries entry ids
+
+The first version of the seam handed handlers `messages: tuple[AgentMessage, ...]`
+and nothing else, and `ExtensionContext.transcript()` strips ids too. Checking
+that against what a deterministic engine actually needs showed three things it
+could not do with bare messages:
+
+- choose its own cut, since a boundary is an **entry id**;
+- keep a `toolCall` on the same side of the cut as its `toolResult`, since
+  closure safety is a statement about positions in the entry stream;
+- cite what it left out, so an omitted span stays expandable from the session.
+
+So `BeforeCompactEvent.entries` carries the whole active context in order as
+`CompactionContextEntry(entry_id, message)` rows — including the rows the cut
+would keep, because the retained half is what tells an engine whether its
+boundary orphans a tool pair. `messages` stays as the exact prefix Tau's
+`first_kept_entry_id` would drop, which is all a simple handler wants.
+
+Plumbing cost is one field: `_recent_preserving_compaction_plan()` already builds
+from `self._active_context_rows()`, which is `tuple[tuple[str, AgentMessage], ...]`
+— the same shape `tau_coding.compaction` normalizes — so `CompactionPlan` now
+keeps those rows instead of discarding them.
+
+This was safe to change because `before_compact` exists in no released Tau: the
+installed `tau-ai` 0.4.8 has no trace of it, so there is no older handler to keep
+source-compatible.
+
 ## Mapping to Pi's design
 
 | Pi | Tau |
 | --- | --- |
 | `session_before_compact` hook | `before_compact` lifecycle hook |
+| hook payload `{ messages, firstKeptEntryId, ... }` | `BeforeCompactEvent(entries, messages, first_kept_entry_id, ...)` |
 | hook result `{ summary, firstKeptEntryId }` | `CompactHookResult(summary, first_kept_entry_id, details)` |
 | handlers in load order, latest non-cancelling wins | same |
 | a cancellation terminates dispatch | same |
@@ -89,7 +117,8 @@ from tau_coding.extensions import BeforeCompactEvent, CompactHookResult
 
 def setup(tau):
     def engine(event: BeforeCompactEvent, context) -> CompactHookResult:
-        summary = deterministic_projection(event.messages, event)  # no provider call
+        rows = [(item.entry_id, item.message) for item in event.entries]
+        summary = deterministic_projection(rows, event)  # no provider call
         return CompactHookResult(
             action="replace",
             summary=summary,
@@ -105,9 +134,12 @@ def setup(tau):
 tests/test_extensions.py       six dispatch tests: latest-wins precedence, cancel
                                short-circuit, defer-by-default, blank-summary
                                rejection, crash containment, payload integrity
-tests/test_coding_session.py   five wiring tests: manual replacement with no
-                               provider call, boundary override, manual cancel,
-                               automatic cancel, invalid-boundary containment
+                               including entry ids and the messages/cut prefix
+tests/test_coding_session.py   seven wiring tests: manual replacement with no
+                               provider call, boundary override, entries covering
+                               both halves of the cut, engine-chosen boundary,
+                               manual cancel, automatic cancel, invalid-boundary
+                               containment
 tests/test_session.py          `details` JSONL round trip; sessions without the
                                field load as `None` and serialize without it
 ```

@@ -82,7 +82,7 @@ from tau_coding.events import (
     SessionInfoChangedEvent,
     ThinkingLevelChangedEvent,
 )
-from tau_coding.extensions.api import BeforeCompactEvent
+from tau_coding.extensions.api import BeforeCompactEvent, CompactionContextEntry
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
@@ -298,11 +298,18 @@ class SessionResources:
 
 @dataclass(frozen=True, slots=True)
 class CompactionPlan:
-    """Prepared active-context entries for a compaction run."""
+    """Prepared active-context entries for a compaction run.
+
+    `context_rows` keeps the entry ids alongside the messages: the boundary is
+    an entry id, so an id-less message list cannot describe the cut, and a
+    replacement engine has to see the retained half to avoid splitting a tool
+    call from its result.
+    """
 
     first_kept_entry_id: str
     replaced_entry_count: int
     messages_to_summarize: tuple[AgentMessage, ...]
+    context_rows: tuple[tuple[str, AgentMessage], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4080,6 +4087,10 @@ class CodingSession:
         return await self._extension_runtime.run_before_compact_hooks(
             BeforeCompactEvent(
                 trigger=trigger,
+                entries=tuple(
+                    CompactionContextEntry(entry_id=entry_id, message=message)
+                    for entry_id, message in plan.context_rows
+                ),
                 messages=plan.messages_to_summarize,
                 first_kept_entry_id=plan.first_kept_entry_id,
                 replaced_entry_count=plan.replaced_entry_count,
@@ -4203,6 +4214,7 @@ class CodingSession:
             first_kept_entry_id=rows[first_kept_index][0],
             replaced_entry_count=len(replaced),
             messages_to_summarize=tuple(message for _entry_id, message in replaced),
+            context_rows=rows,
         )
 
     def _active_context_rows(self) -> tuple[tuple[str, AgentMessage], ...]:

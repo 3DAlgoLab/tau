@@ -507,12 +507,28 @@ class ToolResultHookResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactionContextEntry:
+    """One active-context entry handed to a `before_compact` handler.
+
+    Entry ids are the addresses a replacement engine needs: they let it keep a
+    tool call on the same side of the cut as its result, cite content the
+    summary deliberately left out, and choose a boundary other than Tau's. The
+    message alone cannot do any of that, which is why the whole active context
+    -- including what the cut would keep -- is handed over.
+    """
+
+    entry_id: str
+    message: AgentMessage
+
+
+@dataclass(frozen=True, slots=True)
 class BeforeCompactEvent:
     """Payload for the `before_compact` hook: Pi's `session_before_compact`.
 
     The event describes the compaction Tau was about to perform, so a
-    replacement engine never has to re-derive the plan. `messages` and
-    `first_kept_entry_id` are the built-in model summarizer's inputs and cut;
+    replacement engine never has to re-derive the plan. `entries` is the whole
+    active context in order; `first_kept_entry_id` marks where Tau's cut falls,
+    so entries before it are exactly the ones `messages` would summarize.
     `context_window_tokens` and `keep_recent_tokens` are the budget inputs a
     deterministic engine needs. `instructions` is the user's free-form focus
     from `/compact`, or ``None`` for automatic triggers.
@@ -522,6 +538,7 @@ class BeforeCompactEvent:
     """
 
     trigger: Literal["manual", "threshold", "overflow"]
+    entries: tuple[CompactionContextEntry, ...]
     messages: tuple[AgentMessage, ...]
     first_kept_entry_id: str
     replaced_entry_count: int

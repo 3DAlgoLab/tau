@@ -4187,6 +4187,99 @@ async def test_before_compact_hook_can_move_the_kept_boundary(
 
 
 @pytest.mark.anyio
+async def test_before_compact_entries_cover_both_halves_of_the_cut(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A replacement engine can only pick a closure-safe cut if it can see the
+    # entries the cut would keep, addressed by id.
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(session.prompt("First question."))
+    _second = await _collect_session_events(session.prompt("Second question."))
+    stored_message_ids = [entry.id for entry in await storage.read_all() if entry.type == "message"]
+
+    seen: list[BeforeCompactEvent] = []
+
+    async def capture(event: BeforeCompactEvent) -> CompactHookOutcome:
+        seen.append(event)
+        return CompactHookOutcome(summary="engine summary")
+
+    monkeypatch.setattr(session.extension_runtime, "run_before_compact_hooks", capture)
+
+    await session.compact_detailed()
+
+    event = seen[0]
+    assert [item.entry_id for item in event.entries] == stored_message_ids[: len(event.entries)]
+    boundary = next(
+        index
+        for index, item in enumerate(event.entries)
+        if item.entry_id == event.first_kept_entry_id
+    )
+    assert 0 < boundary < len(event.entries)
+    assert event.messages == tuple(item.message for item in event.entries[:boundary])
+    assert event.replaced_entry_count == boundary
+
+
+@pytest.mark.anyio
+async def test_before_compact_handler_replans_the_boundary_from_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(session.prompt("First question."))
+    _second = await _collect_session_events(session.prompt("Second question."))
+
+    async def replan(event: BeforeCompactEvent) -> CompactHookOutcome:
+        # Engine-style: choose the boundary from the addressed rows rather than
+        # accepting Tau's, keeping only the newest entry.
+        return CompactHookOutcome(
+            summary="engine chose the cut",
+            first_kept_entry_id=event.entries[-1].entry_id,
+            details={"engine": "fabric", "kept": event.entries[-1].entry_id},
+        )
+
+    monkeypatch.setattr(session.extension_runtime, "run_before_compact_hooks", replan)
+
+    detailed = await session.compact_detailed()
+    stored_message_ids = [entry.id for entry in await storage.read_all() if entry.type == "message"]
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert detailed.first_kept_entry_id == stored_message_ids[-1]
+    assert compactions[0].first_kept_entry_id == stored_message_ids[-1]
+    assert compactions[0].details is not None
+    assert compactions[0].details["engine"] == "fabric"
+    assert compactions[0].summary == "engine chose the cut"
+
+
+@pytest.mark.anyio
 async def test_before_compact_cancellation_stops_manual_compaction(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

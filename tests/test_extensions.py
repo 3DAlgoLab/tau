@@ -35,6 +35,7 @@ from tau_coding import (
 from tau_coding.extensions import (
     BeforeCompactEvent,
     CompactHookResult,
+    CompactionContextEntry,
     CustomMessageView,
     DynamicProvider,
     ExtensionAPI,
@@ -1290,6 +1291,16 @@ async def test_input_hook_handled_short_circuits(tmp_path: Path) -> None:
 def _before_compact_event(**overrides: object) -> BeforeCompactEvent:
     values: dict[str, object] = {
         "trigger": "manual",
+        "entries": (
+            CompactionContextEntry(
+                entry_id="older-entry",
+                message=UserMessage(content="earlier work"),
+            ),
+            CompactionContextEntry(
+                entry_id="kept-entry",
+                message=UserMessage(content="kept turn"),
+            ),
+        ),
         "messages": (UserMessage(content="earlier work"),),
         "first_kept_entry_id": "kept-entry",
         "replaced_entry_count": 3,
@@ -1422,6 +1433,12 @@ async def test_before_compact_event_reaches_handler_intact(tmp_path: Path) -> No
     assert seen[0].context_window_tokens == 128_000
     assert seen[0].tokens_before == 40_000
     assert seen[0].messages == (UserMessage(content="earlier work"),)
+    # Entry addresses survive the hand-off, and `messages` is exactly the prefix
+    # the default cut would drop.
+    assert [item.entry_id for item in seen[0].entries] == ["older-entry", "kept-entry"]
+    assert seen[0].messages == tuple(
+        item.message for item in seen[0].entries if item.entry_id != "kept-entry"
+    )
 
 
 def test_input_event_defaults_backward_compatible() -> None:

@@ -686,7 +686,7 @@ Lifecycle and intercepting hooks:
 | `input` | `InputEvent(text)` | `InputHookResult(action, text, message)` |
 | `tool_call` | `ToolCallHookEvent(tool_name, arguments)` | `ToolCallHookResult(block, reason, arguments)` |
 | `tool_result` | `ToolResultHookEvent(tool_name, arguments, result)` | `ToolResultHookResult(content, details)` |
-| `before_compact` | `BeforeCompactEvent(trigger, messages, first_kept_entry_id, replaced_entry_count, tokens_before, context_window_tokens, keep_recent_tokens, instructions)` | `CompactHookResult(action, summary, first_kept_entry_id, details)` |
+| `before_compact` | `BeforeCompactEvent(trigger, entries, messages, first_kept_entry_id, replaced_entry_count, tokens_before, context_window_tokens, keep_recent_tokens, instructions)` | `CompactHookResult(action, summary, first_kept_entry_id, details)` |
 
 - `session_start` fires once the host frontend is attached (Pi's ordering:
   the UI starts before extensions initialize), so handlers can call
@@ -708,6 +708,39 @@ Lifecycle and intercepting hooks:
   same precedence Pi uses for `session_before_compact`. This is distinct from the
   observational `compaction_start`/`compaction_end` agent events, which cannot
   change the outcome.
+- `entries` is the whole active context in order, each row a
+  `CompactionContextEntry(entry_id, message)`. Entry ids are what make a
+  replacement engine possible: they let it keep a tool call on the same side of
+  the cut as its result, cite content the summary deliberately left out, and
+  choose a boundary other than Tau's. `messages` is exactly the prefix
+  `first_kept_entry_id` would drop, and `context_window_tokens` /
+  `keep_recent_tokens` / `tokens_before` are the budget inputs. A
+  `first_kept_entry_id` you return must name a live context entry; an unknown id
+  aborts the compaction instead of corrupting replay.
+
+A compaction engine replaces Tau's summarizer request with its own plan:
+
+```python
+from tau_coding.extensions import CompactHookResult
+
+
+def setup(tau):
+    @tau.on("before_compact")
+    def deterministic(event, ctx):
+        rows = [(item.entry_id, item.message) for item in event.entries]
+        cut = compute_cut(rows)  # your engine picks a closure-safe boundary
+        if cut is None:
+            return None  # defer to Tau's model-generated summary
+        return CompactHookResult(
+            action="replace",
+            summary=render_summary(cut),
+            first_kept_entry_id=cut.first_kept_entry_id,
+            details={"engine": "deterministic", "events": len(cut.summarized_rows)},
+        )
+```
+
+Whatever `details` you return is persisted on the compaction entry, so a later
+run can tell which engine produced the summary and expand what it omitted.
 
 All other handler failures are contained: they are recorded as diagnostics
 (visible in `/session`) and never crash the session.
