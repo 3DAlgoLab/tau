@@ -33,6 +33,8 @@ from tau_coding import (
     TauResourcePaths,
 )
 from tau_coding.extensions import (
+    BeforeCompactEvent,
+    CompactHookResult,
     CustomMessageView,
     DynamicProvider,
     ExtensionAPI,
@@ -1283,6 +1285,143 @@ async def test_input_hook_handled_short_circuits(tmp_path: Path) -> None:
 
     assert outcome.handled is True
     assert outcome.message == "done"
+
+
+def _before_compact_event(**overrides: object) -> BeforeCompactEvent:
+    values: dict[str, object] = {
+        "trigger": "manual",
+        "messages": (UserMessage(content="earlier work"),),
+        "first_kept_entry_id": "kept-entry",
+        "replaced_entry_count": 3,
+        "tokens_before": 40_000,
+        "context_window_tokens": 128_000,
+        "keep_recent_tokens": 20_000,
+        "instructions": None,
+    }
+    values.update(overrides)
+    return BeforeCompactEvent(**values)  # type: ignore[arg-type]
+
+
+async def test_before_compact_latest_replacement_wins(tmp_path: Path) -> None:
+    # Mirrors Pi's `session_before_compact`: handlers run in load order and the
+    # last non-deferring replacement is the one that commits.
+    runtime = ExtensionRuntime()
+    first = _register_inline_extension(runtime, "first-engine")
+    second = _register_inline_extension(runtime, "second-engine")
+    first.on(  # type: ignore[attr-defined]
+        "before_compact",
+        lambda event, context: CompactHookResult(
+            action="replace", summary="first", details={"engine": "first"}
+        ),
+    )
+    second.on(  # type: ignore[attr-defined]
+        "before_compact",
+        lambda event, context: CompactHookResult(action="replace", summary="second"),
+    )
+
+    outcome = await runtime.run_before_compact_hooks(_before_compact_event())
+
+    assert outcome.cancelled is False
+    assert outcome.summary == "second"
+    assert outcome.details is None
+    assert outcome.first_kept_entry_id == "kept-entry"
+    assert outcome.extension == "second-engine"
+
+
+async def test_before_compact_cancel_terminates_dispatch(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    guard = _register_inline_extension(runtime, "guard")
+    later = _register_inline_extension(runtime, "later-engine")
+    seen: list[str] = []
+
+    def guard_hook(event: BeforeCompactEvent, context: object) -> CompactHookResult:
+        seen.append("guard")
+        return CompactHookResult(action="cancel")
+
+    def later_hook(event: BeforeCompactEvent, context: object) -> CompactHookResult:
+        seen.append("later")
+        return CompactHookResult(action="replace", summary="never")
+
+    guard.on("before_compact", guard_hook)  # type: ignore[attr-defined]
+    later.on("before_compact", later_hook)  # type: ignore[attr-defined]
+
+    outcome = await runtime.run_before_compact_hooks(_before_compact_event())
+
+    assert outcome.cancelled is True
+    assert outcome.extension == "guard"
+    assert outcome.summary is None
+    assert seen == ["guard"]
+
+
+async def test_before_compact_continue_defers_to_tau(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "bystander")
+    api.on("before_compact", lambda event, context: CompactHookResult())  # type: ignore[attr-defined]
+
+    outcome = await runtime.run_before_compact_hooks(_before_compact_event())
+
+    assert outcome.cancelled is False
+    assert outcome.summary is None
+    assert outcome.extension is None
+    assert outcome.details is None
+
+
+async def test_before_compact_rejects_blank_replacement_summary(tmp_path: Path) -> None:
+    # A blank summary would erase model context on replay, so it is rejected as
+    # a bad result rather than persisted.
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "blank-engine")
+    api.on(  # type: ignore[attr-defined]
+        "before_compact",
+        lambda event, context: CompactHookResult(action="replace", summary="   "),
+    )
+
+    outcome = await runtime.run_before_compact_hooks(_before_compact_event())
+
+    assert outcome.summary is None
+    assert outcome.cancelled is False
+    assert any("before_compact" in diagnostic.message for diagnostic in runtime.diagnostics)
+
+
+async def test_raising_before_compact_hook_keeps_later_engine(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "mixed")
+
+    def bad_hook(event: object, context: object) -> None:
+        raise RuntimeError("compaction engine exploded")
+
+    api.on("before_compact", bad_hook)  # type: ignore[attr-defined]
+    api.on(  # type: ignore[attr-defined]
+        "before_compact",
+        lambda event, context: CompactHookResult(action="replace", summary="recovered"),
+    )
+
+    outcome = await runtime.run_before_compact_hooks(_before_compact_event())
+
+    assert outcome.summary == "recovered"
+    assert any("before_compact" in diagnostic.message for diagnostic in runtime.diagnostics)
+
+
+async def test_before_compact_event_reaches_handler_intact(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "observer")
+    seen: list[BeforeCompactEvent] = []
+
+    def _hook(event: BeforeCompactEvent, context: object) -> None:
+        seen.append(event)
+
+    api.on("before_compact", _hook)  # type: ignore[attr-defined]
+
+    await runtime.run_before_compact_hooks(
+        _before_compact_event(trigger="overflow", instructions="keep decisions")
+    )
+
+    assert len(seen) == 1
+    assert seen[0].trigger == "overflow"
+    assert seen[0].instructions == "keep decisions"
+    assert seen[0].context_window_tokens == 128_000
+    assert seen[0].tokens_before == 40_000
+    assert seen[0].messages == (UserMessage(content="earlier work"),)
 
 
 def test_input_event_defaults_backward_compatible() -> None:

@@ -579,6 +579,47 @@ def test_compaction_entry_omits_empty_legacy_id_list_from_jsonl() -> None:
     assert entry_from_json_line(line).replaces_entry_ids == []
 
 
+def test_compaction_entry_round_trips_engine_details() -> None:
+    line = entry_to_json_line(
+        CompactionEntry(
+            id="compact",
+            summary="summary",
+            first_kept_entry_id="kept",
+            tokens_before=42,
+            details={
+                "engine": "fabric",
+                "version": 2,
+                "omissions": {"thinking": 3, "dialogue_bytes": 1024},
+                "source_range": ["entry-1", "entry-9"],
+            },
+        )
+    )
+
+    restored = entry_from_json_line(line)
+
+    assert isinstance(restored, CompactionEntry)
+    assert restored.details == {
+        "engine": "fabric",
+        "version": 2,
+        "omissions": {"thinking": 3, "dialogue_bytes": 1024},
+        "source_range": ["entry-1", "entry-9"],
+    }
+
+
+def test_compaction_entry_without_engine_details_loads_as_none() -> None:
+    # Sessions written before `details` existed must keep loading unchanged.
+    legacy = entry_from_json_line(
+        '{"type":"compaction","id":"compact","summary":"old","first_kept_entry_id":"kept"}'
+    )
+    current = entry_to_json_line(
+        CompactionEntry(id="compact", summary="summary", first_kept_entry_id="kept")
+    )
+
+    assert isinstance(legacy, CompactionEntry)
+    assert legacy.details is None
+    assert "details" not in json.loads(current)
+
+
 def test_legacy_summary_entries_load_without_usage() -> None:
     compaction = entry_from_json_line(
         '{"type":"compaction","id":"compact","summary":"old","replaces_entry_ids":[]}'

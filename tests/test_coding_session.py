@@ -76,7 +76,8 @@ from tau_coding.extensions import (
     OpenAICompatibleTransport,
     ProviderModel,
 )
-from tau_coding.extensions.runtime import InputHookOutcome
+from tau_coding.extensions.api import BeforeCompactEvent
+from tau_coding.extensions.runtime import CompactHookOutcome, InputHookOutcome
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_config import ProviderModelMetadata, provider_thinking_levels
 from tau_coding.session import (
@@ -4088,6 +4089,207 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
             UserMessage(content="Next."),
         ],
     )
+
+
+@pytest.mark.anyio
+async def test_before_compact_hook_replaces_summary_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Session answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _events = await _collect_session_events(session.prompt("Explain sessions."))
+    kept_boundary = [entry.id for entry in await storage.read_all() if entry.type == "message"][-1]
+
+    seen: list[BeforeCompactEvent] = []
+
+    async def replace(event: BeforeCompactEvent) -> CompactHookOutcome:
+        seen.append(event)
+        return CompactHookOutcome(
+            summary="Deterministic engine summary",
+            details={"engine": "fabric", "version": 2},
+            extension="fabric",
+        )
+
+    monkeypatch.setattr(session.extension_runtime, "run_before_compact_hooks", replace)
+
+    detailed = await session.compact_detailed("keep decisions")
+    entries = await storage.read_all()
+    compactions = [entry for entry in entries if entry.type == "compaction"]
+
+    assert len(compactions) == 1
+    assert isinstance(compactions[0], CompactionEntry)
+    assert compactions[0].summary == "Deterministic engine summary"
+    assert compactions[0].details == {"engine": "fabric", "version": 2}
+    assert compactions[0].usage is None
+    assert detailed.summary == "Deterministic engine summary"
+
+    # A replacement summary means no summarizer request: exactly one provider
+    # call happened for the whole test, which is the prompt itself.
+    assert len(provider.calls) == 1
+
+    # Replayed context carries the extension summary as the active tip.
+    assert "Deterministic engine summary" in str(session.messages[0].content)
+
+    assert seen[0].trigger == "manual"
+    assert seen[0].instructions == "keep decisions"
+    assert seen[0].first_kept_entry_id == kept_boundary
+    assert seen[0].keep_recent_tokens == 1
+    assert seen[0].context_window_tokens == session.context_window_tokens
+    assert seen[0].tokens_before > 0
+    assert seen[0].replaced_entry_count == len(seen[0].messages)
+
+
+@pytest.mark.anyio
+async def test_before_compact_hook_can_move_the_kept_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(session.prompt("First question."))
+    _second = await _collect_session_events(session.prompt("Second question."))
+    message_ids = [entry.id for entry in await storage.read_all() if entry.type == "message"]
+    earliest_user_entry = message_ids[1]
+
+    async def move(event: BeforeCompactEvent) -> CompactHookOutcome:
+        return CompactHookOutcome(summary="wider window", first_kept_entry_id=earliest_user_entry)
+
+    monkeypatch.setattr(session.extension_runtime, "run_before_compact_hooks", move)
+
+    detailed = await session.compact_detailed()
+
+    assert detailed.first_kept_entry_id == earliest_user_entry
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert compactions[0].first_kept_entry_id == earliest_user_entry
+
+
+@pytest.mark.anyio
+async def test_before_compact_cancellation_stops_manual_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Session answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _events = await _collect_session_events(session.prompt("Explain sessions."))
+
+    async def cancel(event: BeforeCompactEvent) -> CompactHookOutcome:
+        return CompactHookOutcome(cancelled=True, extension="guardian")
+
+    monkeypatch.setattr(session.extension_runtime, "run_before_compact_hooks", cancel)
+
+    with pytest.raises(ValueError, match="Compaction cancelled by extension `guardian`"):
+        await session.compact_detailed()
+
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_before_compact_cancellation_stops_auto_compaction(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+        )
+    )
+
+    async def cancel(event: BeforeCompactEvent) -> CompactHookOutcome:
+        assert event.trigger == "threshold"
+        return CompactHookOutcome(cancelled=True, extension="guardian")
+
+    session.extension_runtime.run_before_compact_hooks = cancel  # type: ignore[method-assign]
+
+    _events = await _collect_session_events(session.prompt("Explain sessions."))
+
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_auto_compaction_with_unknown_hook_boundary_stays_contained(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+        )
+    )
+
+    async def bogus_boundary(event: BeforeCompactEvent) -> CompactHookOutcome:
+        return CompactHookOutcome(summary="phantom", first_kept_entry_id="not-an-entry")
+
+    session.extension_runtime.run_before_compact_hooks = bogus_boundary  # type: ignore[method-assign]
+
+    _first = await _collect_session_events(session.prompt("Explain sessions."))
+    _second = await _collect_session_events(session.prompt("Continue."))
+
+    # The invalid boundary is rejected by the append guard, so nothing is
+    # persisted and the conversation keeps running uncompacted.
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.anyio

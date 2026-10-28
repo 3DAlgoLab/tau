@@ -82,9 +82,10 @@ from tau_coding.events import (
     SessionInfoChangedEvent,
     ThinkingLevelChangedEvent,
 )
+from tau_coding.extensions.api import BeforeCompactEvent
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
-from tau_coding.extensions.runtime import ExtensionRuntime
+from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
 from tau_coding.models_dev_store import ModelsDevRefreshResult, refresh_models_dev_catalog
 from tau_coding.oauth import account_id_from_access_token
 from tau_coding.paths import TauPaths
@@ -3120,22 +3121,33 @@ class CodingSession:
         if plan is None:
             raise ValueError("Not enough context to compact while preserving recent entries")
         tokens_before = self.context_token_estimate
-        generated = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
-            custom_instructions=instructions,
+        outcome = await self._run_before_compact_hooks(
+            plan,
+            trigger="manual",
+            instructions=instructions,
+        )
+        if outcome.cancelled:
+            raise ValueError(
+                f"Compaction cancelled by extension `{outcome.extension or 'unknown'}`"
+            )
+        generated = await self._resolve_compaction_summary(
+            plan,
+            outcome,
+            instructions=instructions,
         )
         await self._append_compaction(
             generated.text,
-            first_kept_entry_id=plan.first_kept_entry_id,
+            first_kept_entry_id=outcome.first_kept_entry_id or plan.first_kept_entry_id,
             tokens_before=tokens_before,
             usage=generated.usage,
             provider=generated.provider,
             model=generated.model,
             response_provider=generated.response_provider,
+            details=outcome.details,
         )
         return ManualCompactionResult(
             summary=generated.text,
-            first_kept_entry_id=plan.first_kept_entry_id,
+            first_kept_entry_id=outcome.first_kept_entry_id or plan.first_kept_entry_id,
             tokens_before=tokens_before,
             estimated_tokens_after=self.context_token_estimate,
             replaced_entry_count=plan.replaced_entry_count,
@@ -3892,15 +3904,23 @@ class CodingSession:
             if plan is None:
                 return False
             tokens_before = self.context_token_estimate
-            generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+            outcome = await self._run_before_compact_hooks(
+                plan,
+                trigger="overflow",
+                instructions=None,
+            )
+            if outcome.cancelled:
+                return False
+            generated = await self._resolve_compaction_summary(plan, outcome)
             await self._append_compaction(
                 generated.text,
-                first_kept_entry_id=plan.first_kept_entry_id,
+                first_kept_entry_id=outcome.first_kept_entry_id or plan.first_kept_entry_id,
                 tokens_before=tokens_before,
                 usage=generated.usage,
                 provider=generated.provider,
                 model=generated.model,
                 response_provider=generated.response_provider,
+                details=outcome.details,
             )
             return True
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
@@ -4022,17 +4042,72 @@ class CodingSession:
         if plan is None:
             return False
         tokens_before = self.context_token_estimate
-        generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+        outcome = await self._run_before_compact_hooks(
+            plan,
+            trigger="threshold",
+            instructions=None,
+        )
+        if outcome.cancelled:
+            return False
+        generated = await self._resolve_compaction_summary(plan, outcome)
         await self._append_compaction(
             generated.text,
-            first_kept_entry_id=plan.first_kept_entry_id,
+            first_kept_entry_id=outcome.first_kept_entry_id or plan.first_kept_entry_id,
             tokens_before=tokens_before,
             usage=generated.usage,
             provider=generated.provider,
             model=generated.model,
             response_provider=generated.response_provider,
+            details=outcome.details,
         )
         return True
+
+    async def _run_before_compact_hooks(
+        self,
+        plan: CompactionPlan,
+        *,
+        trigger: Literal["manual", "threshold", "overflow"],
+        instructions: str | None,
+    ) -> CompactHookOutcome:
+        """Let extensions replace or cancel one planned compaction.
+
+        Mirrors Pi's `session_before_compact`: the plan Tau already computed is
+        handed to handlers as the default, so a replacement engine states only
+        its delta. A handler that raises is recorded as an extension diagnostic
+        by the runtime and cannot abort the turn; only an explicit `"cancel"`
+        does.
+        """
+        return await self._extension_runtime.run_before_compact_hooks(
+            BeforeCompactEvent(
+                trigger=trigger,
+                messages=plan.messages_to_summarize,
+                first_kept_entry_id=plan.first_kept_entry_id,
+                replaced_entry_count=plan.replaced_entry_count,
+                tokens_before=self.context_token_estimate,
+                context_window_tokens=self.context_window_tokens,
+                keep_recent_tokens=DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+                instructions=instructions,
+            )
+        )
+
+    async def _resolve_compaction_summary(
+        self,
+        plan: CompactionPlan,
+        outcome: CompactHookOutcome,
+        *,
+        instructions: str | None = None,
+    ) -> _GeneratedSummary:
+        """Return an extension-supplied summary, otherwise ask the provider.
+
+        Extension summaries carry no usage, provider, or model attribution: no
+        summarizer request was made, and inventing one would misreport cost.
+        """
+        if outcome.summary is not None:
+            return _GeneratedSummary(text=outcome.summary, usage=None)
+        return await self._generate_compaction_summary(
+            plan.messages_to_summarize,
+            custom_instructions=instructions,
+        )
 
     async def _generate_compaction_summary(
         self,
@@ -4143,6 +4218,7 @@ class CodingSession:
         provider: str | None = None,
         model: str | None = None,
         response_provider: str | None = None,
+        details: dict[str, JSONValue] | None = None,
     ) -> CompactionEntry:
         if first_kept_entry_id not in self._state.context_entry_ids:
             raise ValueError("First kept entry is not in the active context")
@@ -4156,6 +4232,7 @@ class CodingSession:
             provider=provider,
             model=model,
             response_provider=response_provider,
+            details=details,
         )
         await self._append_session_entry(compaction)
         self._last_parent_id = compaction.id

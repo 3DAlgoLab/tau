@@ -83,6 +83,16 @@ class CompactionEntry(BaseSessionEntry):
     provider: str | None = None
     model: str | None = None
     response_provider: str | None = None
+    details: dict[str, JSONValue] | None = None
+    """Structured, engine-owned provenance for one compaction.
+
+    Tau's built-in model summarizer leaves this empty. A replacement compaction
+    engine records typed facts (engine id, schema version, source ranges,
+    omission counts) so a later compaction can re-derive state from typed data
+    instead of re-reading rendered summary prose. Read-side first, write-side
+    later: the field exists here before any writer populates it, so sessions
+    written by released Tau versions keep loading and replaying unchanged.
+    """
 
 
 class BranchSummaryEntry(BaseSessionEntry):

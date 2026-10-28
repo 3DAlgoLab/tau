@@ -58,6 +58,7 @@ LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset(
         "tool_call",
         "tool_result",
         "project_trust",
+        "before_compact",
     }
 )
 
@@ -502,6 +503,52 @@ class ToolResultHookResult:
     """Result of a `tool_result` hook handler; set fields to override."""
 
     content: str | None = None
+    details: dict[str, JSONValue] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BeforeCompactEvent:
+    """Payload for the `before_compact` hook: Pi's `session_before_compact`.
+
+    The event describes the compaction Tau was about to perform, so a
+    replacement engine never has to re-derive the plan. `messages` and
+    `first_kept_entry_id` are the built-in model summarizer's inputs and cut;
+    `context_window_tokens` and `keep_recent_tokens` are the budget inputs a
+    deterministic engine needs. `instructions` is the user's free-form focus
+    from `/compact`, or ``None`` for automatic triggers.
+
+    Unlike the observational `compaction_start`/`compaction_end` events, this
+    hook can change or stop the operation.
+    """
+
+    trigger: Literal["manual", "threshold", "overflow"]
+    messages: tuple[AgentMessage, ...]
+    first_kept_entry_id: str
+    replaced_entry_count: int
+    tokens_before: int
+    context_window_tokens: int | None = None
+    keep_recent_tokens: int | None = None
+    instructions: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactHookResult:
+    """Result of a `before_compact` hook handler.
+
+    `action="continue"` (the default) defers to Tau's model-generated summary.
+    `"replace"` supplies the summary directly and skips the summarizer request
+    entirely; `summary` is required, and `first_kept_entry_id` is optional —
+    omit it to keep Tau's computed cut. `"cancel"` stops this compaction and
+    ends handler dispatch.
+
+    Mirrors Pi's `session_before_compact` precedence: handlers run in load
+    order, the latest non-deferring replacement wins, and a cancellation
+    terminates dispatch.
+    """
+
+    action: Literal["continue", "replace", "cancel"] = "continue"
+    summary: str | None = None
+    first_kept_entry_id: str | None = None
     details: dict[str, JSONValue] | None = None
 
 

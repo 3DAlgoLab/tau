@@ -686,6 +686,7 @@ Lifecycle and intercepting hooks:
 | `input` | `InputEvent(text)` | `InputHookResult(action, text, message)` |
 | `tool_call` | `ToolCallHookEvent(tool_name, arguments)` | `ToolCallHookResult(block, reason, arguments)` |
 | `tool_result` | `ToolResultHookEvent(tool_name, arguments, result)` | `ToolResultHookResult(content, details)` |
+| `before_compact` | `BeforeCompactEvent(trigger, messages, first_kept_entry_id, replaced_entry_count, tokens_before, context_window_tokens, keep_recent_tokens, instructions)` | `CompactHookResult(action, summary, first_kept_entry_id, details)` |
 
 - `session_start` fires once the host frontend is attached (Pi's ordering:
   the UI starts before extensions initialize), so handlers can call
@@ -698,6 +699,15 @@ Lifecycle and intercepting hooks:
   call. A crashing `tool_call` handler blocks the tool (fail-safe).
 - `tool_result` can rewrite a result's text `content` or `details`; execution
   error state belongs to the host's tool lifecycle rather than the result payload.
+- `before_compact` runs when a compaction is about to happen — manually
+  (`/compact`), by threshold, or after a provider context-overflow error — and
+  it can replace or stop that compaction. `action="replace"` supplies `summary`
+  (and optionally a different `first_kept_entry_id`) so no summarizer request is
+  made at all; `action="cancel"` aborts it. Handlers run in load order, the
+  latest non-deferring replacement wins, and a cancellation ends dispatch — the
+  same precedence Pi uses for `session_before_compact`. This is distinct from the
+  observational `compaction_start`/`compaction_end` agent events, which cannot
+  change the outcome.
 
 All other handler failures are contained: they are recorded as diagnostics
 (visible in `/session`) and never crash the session.

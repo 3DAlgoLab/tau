@@ -38,6 +38,8 @@ from tau_coding.extensions.api import (
     AGENT_EVENT_TYPES,
     AGENT_EVENT_WILDCARD,
     LIFECYCLE_EVENT_TYPES,
+    BeforeCompactEvent,
+    CompactHookResult,
     CustomMessageView,
     ExtensionAPI,
     ExtensionCommandContext,
@@ -199,6 +201,23 @@ class InputHookOutcome:
     handled: bool
     text: str
     message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompactHookOutcome:
+    """Combined outcome of running the `before_compact` hooks.
+
+    One of three states results: every handler deferred (both `cancelled` and
+    `summary` unset, so Tau generates the summary itself), a handler replaced
+    the summary, or a handler cancelled the compaction. `extension` names the
+    winning handler for diagnostics and replay.
+    """
+
+    cancelled: bool = False
+    summary: str | None = None
+    first_kept_entry_id: str | None = None
+    details: dict[str, JSONValue] | None = None
+    extension: str | None = None
 
 
 class ExtensionRuntime:
@@ -1237,6 +1256,45 @@ class ExtensionRuntime:
             if result.action == "transform" and result.text is not None:
                 current = result.text
         return InputHookOutcome(handled=False, text=current)
+
+    async def run_before_compact_hooks(
+        self,
+        event: BeforeCompactEvent,
+    ) -> CompactHookOutcome:
+        """Run `before_compact` hooks; the latest replacement wins, cancel stops.
+
+        Handlers run in extension load order, matching Pi's `session_before_*`
+        precedence. A handler that returns `action="continue"`, ``None``, or a
+        value of the wrong type leaves the decision to later handlers and
+        eventually to Tau's own summarizer. A `"replace"` result with an empty
+        summary is rejected as a bad result rather than persisting a blank
+        summary, which would silently erase model context on replay.
+        """
+        outcome = CompactHookOutcome()
+        for owner, handler in self._handlers_for("before_compact"):
+            try:
+                result = await _resolve(handler(event, self._fresh_context(owner.source_id)))
+            except Exception as exc:  # noqa: BLE001 - extensions are an isolation boundary
+                self._record_runtime_failure(owner.name, "before_compact", exc)
+                continue
+            if result is None:
+                continue
+            if not isinstance(result, CompactHookResult):
+                self._record_bad_result(owner.name, "before_compact", result)
+                continue
+            if result.action == "cancel":
+                return CompactHookOutcome(cancelled=True, extension=owner.name)
+            if result.action == "replace":
+                if result.summary is None or not result.summary.strip():
+                    self._record_bad_result(owner.name, "before_compact", result)
+                    continue
+                outcome = CompactHookOutcome(
+                    summary=result.summary,
+                    first_kept_entry_id=result.first_kept_entry_id or event.first_kept_entry_id,
+                    details=result.details,
+                    extension=owner.name,
+                )
+        return outcome
 
     async def emit_event(self, event: object) -> None:
         """Dispatch one canonical agent or coding-session event to extensions."""
