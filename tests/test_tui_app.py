@@ -8076,7 +8076,14 @@ async def test_tui_tree_labels_filter_timestamps_and_clear() -> None:
 
         await pilot.press("ctrl+l")
         await pilot.pause()
-        assert "2023-11-14" in str(tree_list.children[2].query_one(Label).render())
+        # Clearing the filter is what is under test, not the calendar date on this
+        # machine's zone: the picker renders a label timestamp with the naive local
+        # ``datetime.fromtimestamp`` the TUI uses everywhere, so the expected text is
+        # derived from the same value the session recorded.
+        stamped = datetime.fromtimestamp(session.tree_labels["left"][1]).strftime("%Y-%m-%d %H:%M")
+        assert str(tree_list.children[2].query_one(Label).render()) == (
+            f"  [checkpoint] {stamped} assistant: Left"
+        )
 
         await pilot.press("ctrl+f")
         await pilot.pause()
