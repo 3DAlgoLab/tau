@@ -82,6 +82,11 @@ async def read_frame(reader: asyncio.StreamReader) -> dict[str, Any] | None:
         if exc.partial:
             raise FrameError("truncated frame header") from exc
         return None
+    except (ConnectionError, OSError) as exc:
+        # A reset peer is a dead peer, not a corrupt frame: the stream pushes the
+        # transport's ConnectionResetError in here, and an unhandled OSError would
+        # fly out of the server task instead of ending the kernel with a reason.
+        raise FrameError(f"peer closed the channel: {exc}") from exc
     length = _HEADER.unpack(header)[0]
     if length > MAX_FRAME_BYTES:
         raise FrameTooLargeError(f"incoming frame is {length} bytes, limit is {MAX_FRAME_BYTES}")
@@ -89,6 +94,8 @@ async def read_frame(reader: asyncio.StreamReader) -> dict[str, Any] | None:
         body = await reader.readexactly(length)
     except asyncio.IncompleteReadError as exc:
         raise FrameError("truncated frame body") from exc
+    except (ConnectionError, OSError) as exc:
+        raise FrameError(f"peer closed the channel: {exc}") from exc
     return decode_frame(body)
 
 

@@ -76,6 +76,13 @@ like a key, token, password or credential -- plus provider and ``TAU_*``
 prefixes -- is stripped before the process starts. The kernel's own handshake
 values are injected after filtering.
 
+**A reset peer is a dead kernel, not a raised exception.** The transport pushes
+its `ConnectionResetError` into the `StreamReader`, so `read_frame` translates a
+reset at either stage -- header or body -- into the same `FrameError` a failed write
+already reports. Left as an `OSError` it would fly out of the server task instead of
+ending the kernel with a reason, and under load that turns one dead child into
+failures in whichever tests hold the loop.
+
 **Sub-calls are bounded.** The host serves them through one semaphore shared by
 single and batched requests, so kernel-side fan-out cannot exceed
 ``max_concurrent_subcalls`` regardless of how many ways the cell asks. A failure

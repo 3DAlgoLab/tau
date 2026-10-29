@@ -119,6 +119,26 @@ async def test_async_reader_reports_a_torn_body() -> None:
         await read_frame(reader)
 
 
+async def test_a_reset_peer_ends_the_frame_read_rather_than_the_host() -> None:
+    # The transport pushes its ConnectionResetError into the stream. Left as an
+    # OSError it would fly out of the server task and take down whichever test
+    # happens to be running; here it becomes the same dead-peer FrameError a
+    # write already reports, so the kernel just stops with a reason.
+    reader = asyncio.StreamReader()
+    reader.set_exception(ConnectionResetError(104, "Connection reset by peer"))
+    with pytest.raises(FrameError, match="peer closed the channel"):
+        await read_frame(reader)
+
+
+async def test_a_reset_mid_body_is_a_dead_peer_not_a_torn_frame() -> None:
+    frame = encode_frame({"op": "done", "cell_id": "c1"})
+    reader = asyncio.StreamReader()
+    reader.feed_data(frame[: len(frame) - 3])
+    reader.set_exception(ConnectionResetError(104, "Connection reset by peer"))
+    with pytest.raises(FrameError, match="peer closed the channel"):
+        await read_frame(reader)
+
+
 async def test_write_frame_surfaces_a_dead_peer() -> None:
     class _DeadWriter:
         def write(self, data: bytes) -> None:
