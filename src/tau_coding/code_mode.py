@@ -101,8 +101,8 @@ _REPL_DESCRIPTION = (
     "binds existing files into the namespace as paths to open, so their bytes "
     "never enter the prompt, and context_index()/context_open(refs) do the same "
     "for the session's own history. A cell that exceeds its timeout is killed, "
-    "which also discards the namespace; the budget measures your code, not how long "
-    "llm_query/rlm_query take."
+    "which also discards the namespace; the budget measures your code, not the model "
+    "calls made from inside a cell."
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
@@ -110,7 +110,8 @@ _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batch
 _REPL_RECURSION = (
     " rlm_query(task, model=None) and rlm_query_batched(tasks, model=None) hand "
     "a task to a child with a kernel and turns of its own, and return its answer "
-    "as text; use them for questions worth a sub-agent, not for a lookup."
+    "as text; use them for questions worth a sub-agent, not for a lookup. A "
+    "recursion's own time is not charged to this cell's budget."
 )
 
 _REPL_RECURSION_GUIDELINE = (
