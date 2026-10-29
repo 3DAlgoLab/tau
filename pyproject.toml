@@ -30,10 +30,6 @@ Issues = "https://github.com/huggingface/tau/issues"
 
 [project.scripts]
 tau = "tau_coding.cli:app"
-# Provisional entry point for the code-mode/RLM track: runs this checkout against
-# a separate TAU_HOME so experimental sessions never touch ~/.tau. See
-# src/tau_coding/dev_cli.py; deleting both lines here removes it completely.
-tau-rlm = "tau_coding.dev_cli:main"
 
 [dependency-groups]
 dev = [

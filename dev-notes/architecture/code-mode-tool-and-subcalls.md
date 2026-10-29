@@ -191,8 +191,8 @@ session closing the old kernel.
 refused together, a non-boolean refused rather than read as truthy, and
 round-trip with a shell prefix present.
 
-To run any of it without touching the official install, see
-[The tau-rlm Launcher](./tau-rlm-launcher.md).
+Dev work runs from this checkout: `uv run tau ...` inside `tau-dev`, or a global
+`uv tool install --editable .`. `TAU_HOME` is the one knob for moving a home.
 
 ## Next
 
