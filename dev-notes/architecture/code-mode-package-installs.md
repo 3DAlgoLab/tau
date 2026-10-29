@@ -63,8 +63,9 @@ before it is spawned rather than burned as a failed attempt.
 
 One timeout covers the whole install, shared across resolvers, because the caller
 named a wait and a second resolver after spending it would silently double how long
-a tool call can block. Output is capped at 16 KB, head and tail kept with the middle
-elided -- `uv`'s progress bars are noise, its error lines are the diagnosis. When
+a tool call can block. Output is capped at 8 KiB by keeping the **tail** (`MAX_INSTALL_OUTPUT_BYTES`) --
+`uv`'s progress bars are noise and the diagnosis is the last thing a resolver
+prints, so the head is what gets dropped. When
 every resolver fails, the install returns a report naming each resolver it tried and
 quoting what it said: the model needs to know which one to blame and which spec to
 fix, and `code_mode` turns that into an input refusal so the cell never runs against
