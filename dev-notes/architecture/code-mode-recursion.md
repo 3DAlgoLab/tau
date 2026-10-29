@@ -114,6 +114,30 @@ session-config knob, not a `settings.json` key: how deep to go is a host decisio
 which ceilings to allow at all is the user's.
 
 
+## What a clipped observation actually does to a child
+
+
+The first live recursion (a real model, a 2,401-row / 49 KB CSV, one needle row at
+line 1,875) had one child run one cell: `print(open(path).read())`. It answered
+`{"error": "row not found"}`. Nothing in the mechanism failed -- 1 child, 1 turn,
+1 cell, depth 1, the turn billed to the parent cell's sub-call ledger -- but the
+child had been shown 2 KiB of the 49 KB and a drop count at the *bottom* of that
+wall of text. A model reading the head of a file treats the head as the file.
+
+So an observation now leads with its own truncation, before the bytes:
+
+```text
+[47,226 of 49,275 bytes were dropped: you are reading the head only. If what you
+need is not here, search or count it in code and print the matches ...]
+```
+
+and `CHILD_SYSTEM` states the rule the child actually needed: filter, count and
+search in code rather than dumping, and never conclude absence from a clipped
+print. That is prompt-level damage control, not a fix. The honest fix is the open
+one: reuse the Phase 1 compaction engine so a child's history is compacted rather
+than truncated, and measure the difference before raising a cap on vibes.
+
+
 ## Deliberately not here
 
 

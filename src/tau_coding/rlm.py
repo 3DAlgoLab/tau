@@ -78,7 +78,10 @@ CHILD_SYSTEM = (
     "You are a sub-agent working inside a fresh Python kernel. You get one task "
     "and the output of the cells you have already run. Reply with exactly one "
     "Python cell and nothing else: no prose, no fences, no explanation. "
-    "Statements run as written, so print() what you need to see, and finish by "
+    "Statements run as written, so print() what you need to see -- but only the "
+    "part you need: a print of a large file is clipped and the rest is gone for "
+    "good, so filter, count and search in code instead of dumping. Never claim "
+    "something is absent because it is missing from a clipped print. Finish by "
     "calling ret(value) with the answer as data -- that call ends the task. If "
     "the task cannot be done in code, ret({'answer': ...}) with what you have."
 )
@@ -334,9 +337,22 @@ class RlmQuery:
             parts.append(f"[error] {error}")
         if not parts:
             parts.append("(no output)")
-        text, omitted = bounded_text("\n".join(parts), self._limits.max_observation_bytes)
+        raw = "\n".join(parts)
+        limit = self._limits.max_observation_bytes
+        total = len(raw.encode("utf-8"))
+        text, omitted = bounded_text(raw, limit)
         if omitted:
-            text += f"\n[{omitted} bytes of output dropped]"
+            # The notice goes first. A child that printed a 49 KB file reads 2 KB
+            # of it, and a note at the bottom of that wall of text arrives after
+            # the child has already begun treating the text as the file. The
+            # failure measured on a real model was exactly this: one
+            # print(f.read()) over a 2,401-row ledger, then "row not found",
+            # because the row sat past the clip.
+            return (
+                f"[{omitted:,} of {total:,} bytes were dropped: you are reading the head "
+                "only. If what you need is not here, search or count it in code and print "
+                f"the matches instead of the whole thing.]\n{text}"
+            )
         return text
 
     def _check_deadline(self, meter: _Meter) -> None:

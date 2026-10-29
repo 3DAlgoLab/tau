@@ -212,3 +212,31 @@ async def test_a_child_that_prints_nothing_is_told_so(tmp_path) -> None:
 
     assert outcome.text == "2"
     assert "(no output)" in provider.prompts[1]
+
+
+async def test_a_clipped_observation_warns_before_the_child_reads_it(tmp_path) -> None:
+    # Measured on a real model: a child printed a 49 KB ledger, was shown 2 KiB of
+    # it with the drop count at the bottom, and concluded the missing row did not
+    # exist. The warning has to arrive before the text, with the totals.
+    rows = "\n".join(f"row-{i},a-value-wide-enough-to-cost-bytes" for i in range(2000))
+    (tmp_path / "ledger.csv").write_text(rows + "\n")
+    query, provider, bridge, made = _query(
+        tmp_path,
+        ["print(open('ledger.csv').read())", "ret({'done': True})"],
+        limits=RlmLimits(max_observation_bytes=512),
+    )
+
+    outcome = await query("find the last row of ledger.csv")
+
+    assert outcome.metadata["rlm_returned"] is True
+    second = provider.prompts[1]
+    notice = second.index("bytes were dropped")
+    first_row = second.index("row-0,")
+    assert notice < first_row, "the child must be warned before it reads the head"
+    assert "row-1999" not in second, "the clipped tail must not be presented as the file"
+    assert "head only" in second and "print" in second
+
+
+def test_the_child_is_told_a_clipped_print_proves_nothing() -> None:
+    assert "clipped" in CHILD_SYSTEM
+    assert "absent" in CHILD_SYSTEM
