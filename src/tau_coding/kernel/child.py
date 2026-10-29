@@ -37,6 +37,7 @@ from tau_coding.kernel.frames import (
     send_frame_sync,
 )
 from tau_coding.kernel.protocol import (
+    ENV_CONNECT_TIMEOUT,
     ENV_HOST,
     ENV_PORT,
     ENV_TOKEN,
@@ -512,6 +513,21 @@ class _Kernel:
         self._channel.send({"op": OP_DONE, "cell_id": cell_id, "ok": True})
 
 
+def _connect_timeout() -> float:
+    """How long the kernel waits to *reach* the host -- never for an answer.
+
+    The host leaves this alone; a test shrinks it to prove that an answer landing
+    later than the connect timeout still reaches its cell.
+    """
+
+    raw = os.environ.get(ENV_CONNECT_TIMEOUT, "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return CONNECT_TIMEOUT_SECONDS
+    return value if value > 0 else CONNECT_TIMEOUT_SECONDS
+
+
 def _fatal(message: str) -> None:
     print(f"tau kernel: {message}", file=sys.__stderr__, flush=True)
 
@@ -527,11 +543,18 @@ def main() -> int:
         return 2
 
     try:
-        sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_SECONDS)
+        sock = socket.create_connection((host, port), timeout=_connect_timeout())
     except OSError as exc:
         _fatal(f"cannot reach the host on {host}:{port}: {exc}")
         return 2
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    # ``create_connection`` leaves the socket timed, and that timeout would then
+    # apply to every frame read: a sub-call whose provider turn outlives it dies
+    # inside the cell *after* the host has paid for the completion, and the reply
+    # still in flight desynchronises the next frame read. Reads are blocking from
+    # here; the host's per-cell budget is what bounds a wedged host, because it is
+    # the host that kills this process.
+    sock.settimeout(None)
     reader = sock.makefile("rb")
     channel = _Channel(sock, reader)
 

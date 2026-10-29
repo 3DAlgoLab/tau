@@ -29,7 +29,8 @@ from tau_coding.code_mode import (
     CodeMode,
 )
 from tau_coding.context_entries import ContextEntries
-from tau_coding.kernel.protocol import SubcallOutcome
+from tau_coding.kernel.process import ProcessKernel
+from tau_coding.kernel.protocol import ENV_CONNECT_TIMEOUT, SubcallOutcome
 from tau_coding.kernel.scaffold import RESERVED
 from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.paths import TauPaths
@@ -201,6 +202,54 @@ async def test_sub_calls_are_reported_with_their_cost(tmp_path: Path) -> None:
         assert subcalls["models"] == ["fake"]
         assert result.details["kernel"]["subcalls_used"] == 1
         assert "1 sub-call via fake" in _text(result)
+
+
+class _SlowBridge(SubcallBridge):
+    """A bridge whose answer lands late, the way a real provider turn does."""
+
+    def __init__(self, *args: object, answer_delay: float, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._answer_delay = answer_delay
+
+    async def complete(
+        self, prompt: str, model: str | None = None, *, system: str | None = None
+    ) -> SubcallOutcome:
+        await asyncio.sleep(self._answer_delay)
+        return await super().complete(prompt, model, system=system)
+
+
+async def test_a_sub_call_answer_may_land_after_the_connect_timeout(tmp_path: Path) -> None:
+    """The connect timeout bounds reaching the host, never the host's thinking.
+
+    A provider turn over a chunk of a corpus takes seconds. The kernel used to read
+    the reply on a socket still timed from connecting, so the cell died with
+    ``TimeoutError`` *after* the host had already paid for the completion, and the
+    unanswered reply stayed in the channel to corrupt the next frame read.
+    """
+
+    answer = "two words"
+    stream = [
+        assistant_start(),
+        text_delta(answer),
+        assistant_done(AssistantMessage(model="fake", content=answer)),
+    ]
+    provider = FakeProvider([stream])  # type: ignore[arg-type]
+    bridge = _SlowBridge(provider=lambda: provider, model=lambda: "fake", answer_delay=0.8)
+    # A kernel that gives up reaching the host in 0.2s: the answer lands at 0.8s.
+    factory = lambda: ProcessKernel(  # noqa: E731
+        cwd=tmp_path,
+        subcall=bridge,
+        extra_env={ENV_CONNECT_TIMEOUT: "0.2"},
+    )
+    async with _mode(cwd=tmp_path, subcall=bridge, kernel_factory=factory) as mode:
+        first = await _cell(mode, 'answer = llm_query("count these words")\nprint(answer)')
+        assert first.details["ok"] is True, _text(first)
+        assert answer in _text(first)
+        assert first.details["subcalls"]["calls"] == 1
+        # The channel is not poisoned: the next cell still gets a sub-call, and the
+        # namespace still has what the slow cell bound.
+        second = await _cell(mode, "print(answer.upper())")
+        assert answer.upper() in _text(second)
 
 
 async def test_a_closed_mode_refuses_to_run_again(tmp_path: Path) -> None:

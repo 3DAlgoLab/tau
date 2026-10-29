@@ -40,8 +40,40 @@ A socket rather than the child's standard streams, deliberately:
   makes a failed start explainable instead of silent.
 
 The port is reachable by any local process, so the connection is adopted only
+
 after a token handshake, and a second connection is refused rather than
+
 multiplexed onto a namespace that belongs to the first.
+
+
+
+**Reads are blocking; the connect timeout never becomes a reply deadline.**
+
+``socket.create_connection`` leaves the socket timed, and that timeout would
+
+apply to every later frame read. A live run against a real provider showed what
+
+that costs: a ``llm_query_batched`` of 8 prompts died with ``TimeoutError`` 10 s
+
+after the cell started -- *after* the host had already completed all 8
+
+completions and counted their tokens, and with the reply still sitting in the
+
+socket to desynchronise the next read. So the kernel sets the socket back to
+
+blocking once connected. Nothing else has to guarantee a reply: the host is the
+
+one that kills this process, through the per-cell budget in ``execute``. The
+
+connect timeout stays (overridable with ``TAU_KERNEL_CONNECT_TIMEOUT_SECONDS``,
+
+which the credential filter strips from the inherited environment, so only the
+
+host can set it) and a test in ``tests/test_code_mode.py`` proves an answer
+
+arriving four times later than that timeout still reaches its cell and leaves
+
+the channel usable.
 
 ## The boundary rules
 
