@@ -1652,6 +1652,81 @@ def _constrained_provider_settings() -> ProviderSettings:
     )
 
 
+def _two_model_provider_settings() -> ProviderSettings:
+    """One provider whose catalog default is *not* the model Tau remembered."""
+    return ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="LOCAL_API_KEY",
+                models=("qwen", "qwen-max"),
+                default_model="qwen",
+            ),
+        ),
+    )
+
+
+def _stop_before_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cut a print-mode run off after its session record exists."""
+
+    def stop(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("stop before the turn")
+
+    monkeypatch.setattr(cli, "prepare_coding_session", stop)
+
+
+@pytest.mark.anyio
+async def test_print_mode_starts_from_the_model_tau_remembered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A bare run starts where the last session settled, not at the catalog
+    # default -- the whole point of remembering.
+    home = tmp_path / ".tau"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("TAU_HOME", str(home))
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    (home / "settings.json").write_text(
+        '{"lastModel": {"provider": "local", "model": "qwen-max"}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "load_provider_settings", lambda: _two_model_provider_settings())
+    _stop_before_the_turn(monkeypatch)
+
+    with pytest.raises(AssertionError, match="stop before the turn"):
+        await cli.run_openai_print_mode(prompt="hi", model=None, cwd=tmp_path)
+
+    records = SessionManager(TauPaths(home=home, agents_home=tmp_path / ".agents")).list_sessions(
+        tmp_path
+    )
+    assert records
+    assert (records[0].provider_name, records[0].model) == ("local", "qwen-max")
+
+
+@pytest.mark.anyio
+async def test_an_explicit_model_outranks_the_remembered_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / ".tau"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("TAU_HOME", str(home))
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    (home / "settings.json").write_text(
+        '{"lastModel": {"provider": "local", "model": "qwen-max"}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "load_provider_settings", lambda: _two_model_provider_settings())
+    _stop_before_the_turn(monkeypatch)
+
+    with pytest.raises(AssertionError, match="stop before the turn"):
+        await cli.run_openai_print_mode(prompt="hi", model="qwen", cwd=tmp_path)
+
+    records = SessionManager(TauPaths(home=home, agents_home=tmp_path / ".agents")).list_sessions(
+        tmp_path
+    )
+    assert records
+    assert (records[0].provider_name, records[0].model) == ("local", "qwen")
+
+
 def test_panel_text_strips_ansi_and_borders() -> None:
     """``_panel_text`` must strip ANSI escapes *and* panel borders before matching.
 

@@ -33,6 +33,11 @@ from tau_coding.credentials import (
     OAuthCredential,
     credentials_path,
 )
+from tau_coding.last_model import (
+    apply_last_model,
+    last_model_selection,
+    remember_last_model,
+)
 from tau_coding.oauth_registry import (
     get_oauth_provider,
     get_oauth_providers,
@@ -122,9 +127,11 @@ from tau_coding.session_export import (
 )
 from tau_coding.session_manager import CodingSessionRecord, SessionManager
 from tau_coding.shell_config import (
+    LastModelPreference,
     ShellConfigError,
     ShellSettings,
     load_shell_settings,
+    remember_model_choice,
     shell_settings_from_json,
     shell_settings_path,
 )
@@ -279,8 +286,13 @@ __all__ = [
     "get_oauth_provider",
     "get_oauth_providers",
     "jsonl_session_storage",
+    "apply_last_model",
+    "LastModelPreference",
+    "last_model_selection",
     "load_provider_settings",
     "load_shell_settings",
+    "remember_last_model",
+    "remember_model_choice",
     "load_prompt_templates",
     "load_prompt_templates_with_diagnostics",
     "parse_prompt_template_arguments",

@@ -99,6 +99,7 @@ from tau_coding.extensions.api import (
     SlotWidgetContent,
     SlotWidgetFactory,
 )
+from tau_coding.last_model import apply_last_model
 from tau_coding.oauth import login_openai_codex
 from tau_coding.oauth_registry import get_oauth_provider, oauth_provider_ids
 from tau_coding.oauth_types import (
@@ -8941,6 +8942,14 @@ async def run_tui_app(
 
     provider_settings = load_provider_settings()
     shell_settings = load_shell_settings()
+    provider_name, model = apply_last_model(
+        provider_settings,
+        shell_settings,
+        provider_name=provider_name,
+        model=model,
+        explicit_resume=session_id is not None,
+        credential_reader=FileCredentialStore(),
+    )
     manager = session_manager or SessionManager()
     record = _explicit_resume_record(
         manager,

@@ -26,6 +26,7 @@ from tau_coding.commands import format_reload_summary
 from tau_coding.credentials import FileCredentialStore
 from tau_coding.extension_installer import ExtensionInstallError, install_extension
 from tau_coding.extensions import StderrUiBridge
+from tau_coding.last_model import apply_last_model
 from tau_coding.models_dev_store import (
     ModelsDevRefreshError,
     ModelsDevRefreshResult,
@@ -969,6 +970,13 @@ async def run_openai_rpc_mode(
     """Run a persistent Pi-compatible JSONL RPC session."""
     settings = load_provider_settings()
     shell_settings = load_shell_settings()
+    provider_name, model = apply_last_model(
+        settings,
+        shell_settings,
+        provider_name=provider_name,
+        model=model,
+        explicit_resume=resume_session_id is not None,
+    )
     manager = SessionManager()
     record = _print_session_record(
         manager,
@@ -1080,6 +1088,13 @@ async def run_openai_print_mode(
     """Run a new or resumed print-mode turn using the configured provider."""
     settings = load_provider_settings()
     shell_settings = load_shell_settings()
+    provider_name, model = apply_last_model(
+        settings,
+        shell_settings,
+        provider_name=provider_name,
+        model=model,
+        explicit_resume=resume_session_id is not None,
+    )
     manager = session_manager or SessionManager()
     record = _print_session_record(
         manager,

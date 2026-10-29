@@ -75,6 +75,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [File Handles In The Kernel (Phase 2c-i)](./code-mode-file-handles.md)
 - [Session History Handles In The Kernel (Phase 2c-ii)](./code-mode-context-handles.md)
 - [Recursion Inside python_repl (Phase 2c-iii)](./code-mode-recursion.md)
+- [Remembered Model Selection at Startup](./last-model-startup-selection.md)
 
 Phase 21 extensions are implemented; see the phase note and the user guide at
 `website/content/guides/extensions.md`.

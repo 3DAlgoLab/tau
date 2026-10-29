@@ -90,6 +90,7 @@ from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
 from tau_coding.kernel.process import ProcessKernel
 from tau_coding.kernel.subcall import SubcallBridge
+from tau_coding.last_model import remember_last_model
 from tau_coding.models_dev_store import ModelsDevRefreshResult, refresh_models_dev_catalog
 from tau_coding.oauth import account_id_from_access_token
 from tau_coding.paths import TauPaths
@@ -1716,6 +1717,7 @@ class CodingSession:
         self._refresh_runtime_provider()
         self._sync_image_support()
         self._persist_default_model_choice()
+        self._persist_last_model_choice()
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -1885,6 +1887,7 @@ class CodingSession:
                 await self._close_replaced_provider(old_provider)
         if selected_config is not None and persist_default:
             self._persist_default_model_choice()
+            self._persist_last_model_choice()
         return ModelSelectionResult(choice, changed=True)
 
     def set_inference_provider(self, route: str | None) -> str:
@@ -2140,6 +2143,7 @@ class CodingSession:
         self._sync_image_support()
         if persist_default:
             self._persist_default_model_choice()
+            self._persist_last_model_choice()
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -2296,6 +2300,22 @@ class CodingSession:
         )
         self._apply_runtime_model_catalogs()
         self._sync_thinking_level_to_active_model()
+
+    def _persist_last_model_choice(self) -> None:
+        """Remember this pair as the provider/model the next session starts from.
+
+        Deliberately separate from :meth:`_persist_default_model_choice`: that one
+        refuses to write a model the durable catalog does not list, which is right
+        for a per-provider default and wrong for memory, where the point is to
+        remember an account-specific model that was just used successfully.
+        """
+        if self._durable_provider_settings is None:
+            return
+        remember_last_model(
+            self.provider_name,
+            self.model,
+            paths=self._resource_paths.paths,
+        )
 
     def _persist_thinking_level_choice(self) -> None:
         if self._provider_settings is None:

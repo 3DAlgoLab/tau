@@ -1,12 +1,15 @@
+from json import loads
 from pathlib import Path
 
 import pytest
 
 from tau_coding import (
+    LastModelPreference,
     ShellConfigError,
     ShellSettings,
     TauPaths,
     load_shell_settings,
+    remember_model_choice,
     shell_settings_from_json,
     shell_settings_path,
 )
@@ -137,3 +140,70 @@ def test_code_mode_is_read_from_the_durable_settings_file(tmp_path: Path) -> Non
     path.write_text('{"codeMode": false}', encoding="utf-8")
 
     assert load_shell_settings(paths).code_mode is False
+
+
+def test_the_remembered_model_pair_round_trips_through_the_settings_file() -> None:
+    settings = shell_settings_from_json({"lastModel": {"provider": "dpi2", "model": "coder2"}})
+
+    assert settings.last_model == LastModelPreference(provider_name="dpi2", model="coder2")
+    assert settings.to_json() == {"lastModel": {"provider": "dpi2", "model": "coder2"}}
+
+
+def test_the_remembered_pair_accepts_the_snake_case_alias() -> None:
+    settings = shell_settings_from_json({"last_model": {"provider": "openai", "model": "gpt-5.4"}})
+
+    assert settings.last_model is not None
+    assert settings.last_model.provider_name == "openai"
+    assert settings.last_model.model == "gpt-5.4"
+
+
+def test_the_remembered_pair_refuses_both_spellings() -> None:
+    pair = {"provider": "dpi2", "model": "coder2"}
+
+    with pytest.raises(ShellConfigError, match="lastModel or last_model"):
+        shell_settings_from_json({"lastModel": pair, "last_model": pair})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '"dpi2/coder2"',
+        '{"provider": "dpi2"}',
+        '{"provider": "", "model": "coder2"}',
+        '{"provider": "dpi2", "model": 7}',
+    ],
+)
+def test_a_half_shaped_remembered_pair_is_refused(payload: object) -> None:
+    # A pair that parses to "provider dpi2, model ?" would start every later
+    # session on a half-known selection; refusing it keeps the failure at the file.
+    with pytest.raises(ShellConfigError):
+        shell_settings_from_json({"lastModel": payload})
+
+
+def test_remembering_a_pair_keeps_keys_this_version_does_not_understand(
+    tmp_path: Path,
+) -> None:
+    # The reader ignores unknown keys so a newer Tau can write them; a writer
+    # must not quietly delete them on the way back out.
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    path = shell_settings_path(paths)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"codeMode": false, "someFutureSetting": {"kept": true}}', encoding="utf-8")
+
+    remember_model_choice(LastModelPreference(provider_name="dpi2", model="coder2"), paths=paths)
+
+    reloaded = load_shell_settings(paths)
+    assert reloaded.code_mode is False
+    assert reloaded.last_model == LastModelPreference(provider_name="dpi2", model="coder2")
+    assert loads(path.read_text(encoding="utf-8"))["someFutureSetting"] == {"kept": True}
+
+
+def test_remembering_a_pair_replaces_the_previous_one(tmp_path: Path) -> None:
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+
+    remember_model_choice(LastModelPreference(provider_name="dpi2", model="coder2"), paths=paths)
+    remember_model_choice(LastModelPreference(provider_name="zai", model="glm-5.1"), paths=paths)
+
+    raw = loads(shell_settings_path(paths).read_text(encoding="utf-8"))
+    assert raw["lastModel"] == {"provider": "zai", "model": "glm-5.1"}
+    assert "last_model" not in raw

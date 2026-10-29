@@ -90,6 +90,17 @@ sub-call budget. Off by default because it is a cost decision rather than a
 capability one -- a recursion starts another process -- and the ceilings are
 Tau's, not settings.
 
+`settings.json` may also contain `"lastModel": {"provider": "…", "model":
+"…"}`. Tau writes it itself whenever a session settles on a provider and model
+-- at startup, on `/model`, or at the end of a print-mode turn -- and a later
+bare `tau`, `tau --print`, or `tau --rpc` starts from that pair instead of the
+provider catalog's default. It is not a knob to hand-edit: the remembered pair
+is used only while it still resolves, because a pair whose provider was
+deleted, whose model left the catalog, or whose account credentials are gone
+would otherwise fail every new session on this machine. `--provider` /
+`--model` override it (and refresh it); `--resume` and `--session-id` ignore it,
+since the saved transcript carries the model it was recorded with.
+
 Startup update checks cache their latest PyPI result in
 `~/.tau/cache/update-check.json` and refresh at most once per day. A failed
 check (for example while offline) is retried after an hour. Set
