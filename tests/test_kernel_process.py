@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -89,10 +90,23 @@ async def test_a_raising_cell_does_not_end_the_kernel(tmp_path: Path) -> None:
 
 
 async def test_output_is_capped_and_the_loss_is_counted(tmp_path: Path) -> None:
+    # The cap keeps BOTH ends: a head spent while the cell streams, and a tail
+    # reserved so the last thing printed survives a long print the way the first
+    # thing does. A head-only cap is what convinced a child that a truncated view
+    # of a file was the whole file.
     async with _running(tmp_path, max_cell_output_bytes=1024) as kernel:
         result = await kernel.execute("print('x' * 5000)")
-        assert len(result.stdout.encode("utf-8")) == 1024
-        assert result.stdout_omitted_bytes == 5001 - 1024
+
+        assert len(result.stdout.encode("utf-8")) <= 1024
+        assert result.stdout.startswith("x" * 64), "the head is intact"
+        assert result.stdout.endswith("x\n"), "the end of the print survived the cap"
+
+        notice = re.search(r"\[middle omitted: ([\d,]+) UTF-8 bytes[^\]]*\]\n", result.stdout)
+        assert notice, "the cap has to be announced, not silent"
+        announced = int(notice.group(1).replace(",", ""))
+        kept = len(result.stdout.encode("utf-8")) - len(notice.group(0).encode("utf-8"))
+        assert announced == result.stdout_omitted_bytes, "two counts, one number"
+        assert kept + announced == 5001, "every byte of the print is kept or counted"
         assert result.omitted_bytes == result.stdout_omitted_bytes + result.stderr_omitted_bytes
 
 

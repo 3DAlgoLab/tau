@@ -37,6 +37,13 @@ from typing import TYPE_CHECKING
 
 from tau_agent.tools import ToolCancellationToken
 from tau_agent.types import JSONValue
+from tau_coding.kernel.history import (
+    DEFAULT_COLLAPSED_BYTES,
+    DEFAULT_MAX_HISTORY_BYTES,
+    DEFAULT_VERBATIM_TURNS,
+    keep_ends,
+    render_history,
+)
 from tau_coding.kernel.protocol import Kernel, RlmFn, SubcallOutcome, bounded_text
 
 if TYPE_CHECKING:
@@ -104,6 +111,9 @@ class RlmLimits:
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS
     max_answer_bytes: int = DEFAULT_MAX_ANSWER_BYTES
     max_observation_bytes: int = DEFAULT_MAX_OBSERVATION_BYTES
+    max_history_bytes: int = DEFAULT_MAX_HISTORY_BYTES
+    verbatim_turns: int = DEFAULT_VERBATIM_TURNS
+    collapsed_turn_bytes: int = DEFAULT_COLLAPSED_BYTES
 
     def __post_init__(self) -> None:
         if self.max_depth < 0:
@@ -317,12 +327,31 @@ class RlmQuery:
     def _task_prompt(self, task: str, observations: list[str]) -> str:
         if not observations:
             return f"Task: {task}\n\nWrite the first cell."
-        block = _observations_block(observations, numbered=True)
+        block = self._history(observations, numbered=True)
         return f"Task: {task}\n\nOutput so far:\n{block}\n\nWrite the next cell."
 
     def _final_prompt(self, task: str, observations: list[str]) -> str:
-        block = _observations_block(observations)
+        block = self._history(observations, numbered=False)
         return f"Task: {task}\n\n{FINAL_TASK}\n\nEvidence:\n{block}"
+
+    def _history(self, observations: list[str], *, numbered: bool) -> str:
+        """Collapse the child's old turns instead of pasting every one of them.
+
+        A child that prints a big file relays that print into every later turn.
+        Head-clipping each observation fixes the size of one entry and leaves the
+        prompt growing with turns, and it hides the tail -- which is where the
+        value a child is looking for usually sits. So the newest turn stays whole,
+        older turns collapse to first line, last line, and a byte count, and the
+        block as a whole is bounded whatever the turn count.
+        """
+        block = render_history(
+            observations,
+            budget_bytes=self._limits.max_history_bytes,
+            verbatim=self._limits.verbatim_turns,
+            collapsed_bytes=self._limits.collapsed_turn_bytes,
+            numbered=numbered,
+        )
+        return block.text
 
     def _observe(self, result: object) -> str:
         stdout = getattr(result, "stdout", "") or ""
@@ -339,21 +368,20 @@ class RlmQuery:
             parts.append("(no output)")
         raw = "\n".join(parts)
         limit = self._limits.max_observation_bytes
-        total = len(raw.encode("utf-8"))
-        text, omitted = bounded_text(raw, limit)
-        if omitted:
-            # The notice goes first. A child that printed a 49 KB file reads 2 KB
-            # of it, and a note at the bottom of that wall of text arrives after
-            # the child has already begun treating the text as the file. The
-            # failure measured on a real model was exactly this: one
-            # print(f.read()) over a 2,401-row ledger, then "row not found",
-            # because the row sat past the clip.
-            return (
-                f"[{omitted:,} of {total:,} bytes were dropped: you are reading the head "
-                "only. If what you need is not here, search or count it in code and print "
-                f"the matches instead of the whole thing.]\n{text}"
-            )
-        return text
+        text, omitted = keep_ends(raw, limit)
+        if not omitted:
+            return text
+        # The notice goes first. A child that printed a 49 KB file reads 2 KB of
+        # it, and a note at the bottom of that wall of text arrives after the child
+        # has already begun treating the text as the file. The failure measured on a
+        # real model was exactly this: one print(f.read()) over a 2,401-row ledger,
+        # then "row not found", because the row sat past the clip.
+        return (
+            f"[{omitted:,} of {len(raw.encode('utf-8')):,} bytes were cut out of the middle: "
+            "you are reading the beginning and the end. If what you need is not in either, "
+            "search or count it in code and print the matches instead of the whole thing.]"
+            f"\n{text}"
+        )
 
     def _check_deadline(self, meter: _Meter) -> None:
         """Refuse to start another turn once the cell is out of time or cancelled."""
@@ -367,14 +395,6 @@ class RlmQuery:
             raise RlmBudgetError(
                 f"this recursion passed its {self._limits.deadline_seconds:g}s ceiling"
             )
-
-
-def _observations_block(observations: list[str], *, numbered: bool = False) -> str:
-    if numbered:
-        return "\n".join(
-            f"--- cell {index} ---\n{text}" for index, text in enumerate(observations, 1)
-        )
-    return "\n".join(observations) if observations else "(nothing ran)"
 
 
 def _cell(text: str) -> str:
@@ -407,6 +427,9 @@ __all__ = [
     "DEFAULT_MAX_DEPTH",
     "DEFAULT_MAX_OBSERVATION_BYTES",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_COLLAPSED_BYTES",
+    "DEFAULT_MAX_HISTORY_BYTES",
+    "DEFAULT_VERBATIM_TURNS",
     "FINAL_TASK",
     "RlmBudgetError",
     "RlmLimits",

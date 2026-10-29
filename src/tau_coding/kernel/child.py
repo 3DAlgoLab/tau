@@ -146,20 +146,77 @@ class _Channel:
 
 
 class _Budget:
-    """A byte allowance that counts what it refused, never silently drops."""
+    """A byte allowance that keeps a head and a tail, and counts the middle out.
 
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
+    A flat head allowance is what made a child believe a big print *was* the file:
+    it saw the first 64 KiB, the rest was dropped inside the kernel, and the row it
+    was looking for sat past the cut. So the allowance is split -- most of it spent
+    as the cell streams, the rest reserved and refilled from the end, so the last
+    thing a cell prints survives as well as the first. Every byte given up is
+    counted, and the tail frame names the count.
+    """
+
+    def __init__(self, limit: int, *, head_fraction: float = 0.75) -> None:
+        self.head_limit = max(1, int(limit * head_fraction))
+        self.tail_limit = max(1, limit - self.head_limit)
         self.omitted_bytes = 0
+        self._head_used = 0
+        self._tail: list[str] = []
+        self._tail_bytes = 0
 
     def allow(self, text: str) -> str:
-        """Return the part of ``text`` still inside the allowance."""
+        """Return the part of ``text`` that belongs to the head; hold back the rest."""
         if not text:
             return ""
-        clipped, omitted = bounded_text(text, self.limit)
-        self.omitted_bytes += omitted
-        self.limit -= len(clipped.encode("utf-8"))
+        room = self.head_limit - self._head_used
+        if room <= 0:
+            self._hold(text)
+            return ""
+        clipped, _omitted = bounded_text(text, room)
+        self._head_used += len(clipped.encode("utf-8"))
+        if len(clipped) < len(text):
+            self._hold(text[len(clipped) :])
         return clipped
+
+    def _hold(self, text: str) -> None:
+        """Keep the most recent ``tail_limit`` bytes; account for everything older."""
+        if not text:
+            return
+        self._tail.append(text)
+        self._tail_bytes += len(text.encode("utf-8"))
+        while self._tail_bytes > self.tail_limit:
+            excess = self._tail_bytes - self.tail_limit
+            oldest = self._tail[0]
+            size = len(oldest.encode("utf-8"))
+            if size <= excess:
+                self._tail.pop(0)
+                self.omitted_bytes += size
+                self._tail_bytes -= size
+                continue
+            keep = size - excess
+            dropped, kept = oldest[:keep], oldest[keep:]
+            self._tail[0] = kept
+            self.omitted_bytes += len(dropped.encode("utf-8"))
+            self._tail_bytes -= len(dropped.encode("utf-8"))
+
+    def take_tail(self) -> str:
+        """Return the reserved tail once, with the middle it stands in for named."""
+        if not self._tail:
+            return ""
+        text = "".join(self._tail)
+        dropped = self.omitted_bytes
+        self._tail.clear()
+        self._tail_bytes = 0
+        if not dropped:
+            return text
+        marker = f"[middle omitted: {dropped:,} UTF-8 bytes; this is the end of the output]\n"
+        # The marker is charged to the tail, so the cell's total observation never
+        # exceeds the budget the caller asked for: announcing the loss may not be
+        # what pushes a run back over the line.
+        room = max(0, self.tail_limit - len(marker.encode("utf-8")))
+        clipped, extra = bounded_text(text, room)
+        self.omitted_bytes = dropped + extra
+        return f"{marker}{clipped}"
 
 
 class _FrameStream(io.TextIOBase):
@@ -199,6 +256,9 @@ class _FrameStream(io.TextIOBase):
 
     def close(self) -> None:
         self.flush()
+        tail = self._budget.take_tail()
+        if tail:
+            self._channel.send({"op": OP_OUT, "stream": self._name, "text": tail})
 
 
 def _format_exception() -> str:
@@ -447,8 +507,10 @@ class _Kernel:
             ok = False
             error = _format_exception()
         finally:
+            # close(), not flush(): the reserved tail of each stream is released
+            # there, and it has to reach the host before the done frame does.
             for stream in streams:
-                stream.flush()
+                stream.close()
             sys.stdout, sys.stderr = previous
             self._channel.cell_id = ""
             self._reassert()

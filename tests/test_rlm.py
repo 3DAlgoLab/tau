@@ -8,6 +8,7 @@ recursion's, not the provider's.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -214,10 +215,58 @@ async def test_a_child_that_prints_nothing_is_told_so(tmp_path) -> None:
     assert "(no output)" in provider.prompts[1]
 
 
-async def test_a_clipped_observation_warns_before_the_child_reads_it(tmp_path) -> None:
+async def test_an_old_turn_collapses_but_its_tail_survives(tmp_path) -> None:
+    # The other half of the same failure. The warning tells the child the print was
+    # cut; it does not give back the row past the cut. A dump older than the newest
+    # turn collapses to its first line, its last line, and a byte count, so the row
+    # at the end of a file is still on screen when the child plans its next cell.
+    rows = [f"{i},a-value-wide-enough-to-cost-bytes" for i in range(2000)]
+    (tmp_path / "ledger.csv").write_text("id,value\n" + "\n".join(rows) + "\n")
+    query, provider, bridge, made = _query(
+        tmp_path,
+        [
+            "print(open('ledger.csv').read())",
+            "print('count', sum(1 for _ in open('ledger.csv')))",
+            "ret('last row is 1999')",
+        ],
+        limits=RlmLimits(max_turns=3, max_observation_bytes=256, max_history_bytes=1200),
+    )
+
+    outcome = await query("find the last row of ledger.csv")
+
+    assert outcome.text == "last row is 1999"
+    third = provider.prompts[2]
+    assert "middle omitted" in third, "the old turn must say it was collapsed"
+    assert "1999,a-value" in third, "the tail of a collapsed turn has to survive"
+    assert "--- cell 1 ---" in third and "--- cell 2 ---" in third
+
+
+async def test_the_history_block_does_not_grow_with_turns(tmp_path) -> None:
+    # Three chatty turns used to be re-pasted in full every turn: the clip was per
+    # observation and the prompt still scaled with turn count.
+    cells = [f"print('x' * 4000); print({i})" for i in range(3)]
+    query, provider, bridge, made = _query(
+        tmp_path,
+        cells + ["ret('done')"],
+        limits=RlmLimits(max_turns=4, max_history_bytes=1500, max_observation_bytes=4200),
+    )
+
+    outcome = await query("count things")
+
+    assert outcome.text == "done"
+    sizes = [len(prompt) for prompt in provider.prompts]
+    # Every turn printed ~4 KB. With no history budget the prompts grow by roughly
+    # 4 KB per turn; the block is capped, so the last prompt may not be much bigger
+    # than the second one.
+    assert sizes[-1] <= sizes[1] + 1900, f"history scaled with turns: {sizes}"
+
+
+async def test_a_cut_observation_warns_first_and_keeps_both_ends(tmp_path) -> None:
     # Measured on a real model: a child printed a 49 KB ledger, was shown 2 KiB of
     # it with the drop count at the bottom, and concluded the missing row did not
-    # exist. The warning has to arrive before the text, with the totals.
+    # exist. Two things were wrong -- the warning arrived after the wall of text, and
+    # what it kept was only the head, so the row the child wanted was exactly the part
+    # that was gone. Both are pinned here.
     rows = "\n".join(f"row-{i},a-value-wide-enough-to-cost-bytes" for i in range(2000))
     (tmp_path / "ledger.csv").write_text(rows + "\n")
     query, provider, bridge, made = _query(
@@ -230,11 +279,19 @@ async def test_a_clipped_observation_warns_before_the_child_reads_it(tmp_path) -
 
     assert outcome.metadata["rlm_returned"] is True
     second = provider.prompts[1]
-    notice = second.index("bytes were dropped")
+    notice = second.index("bytes were cut out of the middle")
     first_row = second.index("row-0,")
     assert notice < first_row, "the child must be warned before it reads the head"
-    assert "row-1999" not in second, "the clipped tail must not be presented as the file"
-    assert "head only" in second and "print" in second
+    totals = re.search(r"\[(\d[\d,]*) of (\d[\d,]*) bytes were cut out", second)
+    assert totals, "the notice states both totals"
+    cut, total = (int(x.replace(",", "")) for x in totals.groups())
+    assert total > cut > 0, "the notice states both totals"
+    kernel_cut = re.search(r"middle omitted: ([\d,]+)", second)
+    assert kernel_cut, "the kernel's own cut is visible too, not just the recursion's"
+    assert "middle omitted" in second
+    assert "row-1999," in second, "the end of the output has to survive the cut"
+    assert "row-999," not in second, "the middle stays out: both ends, not everything"
+    assert "search or count it in code" in second, "the child is told how to get the rest"
 
 
 def test_the_child_is_told_a_clipped_print_proves_nothing() -> None:
