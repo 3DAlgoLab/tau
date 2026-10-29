@@ -265,6 +265,43 @@ async def test_a_closed_mode_refuses_to_run_again(tmp_path: Path) -> None:
         await mode.dispose()
 
 
+async def test_the_cell_budget_measures_the_cell_not_the_provider(tmp_path: Path) -> None:
+    """A cell dies for its own code, never for how long a provider turn takes.
+
+    Two *sequential* sub-calls answered in 0.6 s each used to blow a 1 s cell budget:
+    the cell was killed, ``state_lost`` was set and the namespace went with it, while
+    the cell itself had never overrun. Recursion is serial by construction, so on the
+    30 s default a handful of slow turns did exactly this in a real run.
+    """
+
+    streams: list[list[object]] = []
+    for index in range(2):
+        answer = f"answer {index}"
+        streams.append(
+            [
+                assistant_start(),
+                text_delta(answer),
+                assistant_done(AssistantMessage(model="fake", content=answer)),
+            ]
+        )
+    provider = FakeProvider(streams)  # type: ignore[arg-type]
+    bridge = _SlowBridge(provider=lambda: provider, model=lambda: "fake", answer_delay=0.6)
+    async with _mode(cwd=tmp_path, subcall=bridge, cell_timeout_seconds=1.0) as mode:
+        warm = await _cell(mode, "corpus = 'x' * 10\nprint('ready')")
+        assert warm.details["ok"] is True, _text(warm)
+
+        cell = await _cell(
+            mode, 'a = llm_query("one")\nb = llm_query("two")\nprint(len(a), len(b))'
+        )
+        assert cell.details["ok"] is True, _text(cell)
+        assert cell.details["timed_out"] is False
+        assert cell.details["subcalls"]["calls"] == 2
+
+        survivor = await _cell(mode, "print(len(corpus))")
+        assert survivor.details["ok"] is True
+        assert "10" in _text(survivor)
+
+
 async def test_empty_and_oversized_cells_are_refused_before_the_kernel(tmp_path: Path) -> None:
     async with _mode(cwd=tmp_path) as mode:
         with pytest.raises(ToolInputError, match="non-empty"):

@@ -97,7 +97,20 @@ conservation rule the compaction renderer uses.
 **Kill is the only interrupt.** Python offers no way to stop an ``exec`` from
 outside, so a cell over its budget loses its process and its namespace. The
 result carries ``timed_out`` and ``state_lost`` and says so in prose the model
-reads: nothing that cell bound survives. A killed kernel restarts lazily on the
+reads: nothing that cell bound survives.
+
+**A cell's budget measures the cell, not the host.** The wall clock a cell spends
+blocked inside ``llm_query()`` / ``rlm_query()`` -- while the host runs a provider turn
+or a whole child kernel -- is credited back against its budget, capped at
+``MAX_CREDITED_HOST_SECONDS``. Because the credit grows while the cell is running, the
+wait is re-armed every ``CELL_AWAIT_SLICE_SECONDS`` instead of being armed once.
+Charging host latency to the cell used to kill cells that had never overrun their own
+code: two sequential sub-calls served in 0.6 s each ended a 1 s cell and took its
+namespace with it, and since recursion is serial, slow turns did the same thing to a
+30 s budget in a real run. What bounds the credited time is the host's own discipline --
+the provider client's request timeout, the per-cell sub-call ceiling, and
+``RlmLimits.deadline_seconds`` -- not the cell's budget. A timeout reports both figures,
+so the model learns how much of the wait was the host's. A killed kernel restarts lazily on the
 next cell; a *closed* kernel refuses, so a leaked handle cannot resurrect an
 execution environment behind its owner's back.
 

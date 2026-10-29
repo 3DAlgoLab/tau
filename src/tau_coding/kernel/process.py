@@ -25,8 +25,9 @@ import json
 import os
 import secrets
 import sys
+import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,24 @@ channel.
 """
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 20.0
 CONTROL_TIMEOUT_SECONDS = 5.0
+
+CELL_AWAIT_SLICE_SECONDS = 0.25
+
+"""How often a waiting cell re-reads its own budget.
+
+The budget grows while the host is serving the cell's sub-calls, so the wait is
+sliced rather than armed once: a slice costs milliseconds and keeps the deadline
+honest about which side was actually running.
+"""
+
+MAX_CREDITED_HOST_SECONDS = 600.0
+
+"""Host time one cell may not be billed for, however many sub-calls it makes.
+
+A sub-call is bounded by the provider client's own timeout and a recursion by its
+deadline, so this is the backstop against a wedged handler holding a cell open
+forever -- the accident the cell budget used to cover by killing innocent cells.
+"""
 DEFAULT_CELL_OUTPUT_BYTES = 64 * 1024
 DEFAULT_RAW_TAIL_BYTES = 4096
 
@@ -139,6 +158,7 @@ class _CellBuffer:
         "cell_id",
         "done",
         "frame",
+        "host_seconds",
         "max_bytes",
         "state_lost",
         "cancelled",
@@ -151,6 +171,7 @@ class _CellBuffer:
         self.cell_id = cell_id
         self.done = asyncio.Event()
         self.frame: dict[str, Any] | None = None
+        self.host_seconds = 0.0
         self.max_bytes = max_bytes
         self.state_lost = False
         self.cancelled = False
@@ -260,6 +281,7 @@ class ProcessKernel:
         self._ready = asyncio.Event()
         self._ready_info: Mapping[str, Any] = {}
         self._pending: dict[str, _CellBuffer] = {}
+        self._running_buffer: _CellBuffer | None = None
         self._cell_lock = asyncio.Lock()
         self._subcall_semaphore = asyncio.Semaphore(self._max_concurrent_subcalls)
         self._rlm_semaphore = asyncio.Semaphore(self._max_concurrent_rlms)
@@ -445,6 +467,7 @@ class ProcessKernel:
             # Registered before the process is checked: a stop that lands while this
             # cell is still starting has to answer *this* cell, not a future one.
             self._pending[cell_id] = buffer
+            self._running_buffer = buffer
             timed_out = False
             try:
                 try:
@@ -455,9 +478,7 @@ class ProcessKernel:
                             self._dead_reason or "the kernel channel is not open"
                         )
                     await write_frame(writer, {"op": OP_EXEC, "cell_id": cell_id, "code": code})
-                    try:
-                        await asyncio.wait_for(buffer.done.wait(), limit)
-                    except TimeoutError:
+                    if not await self._await_cell(buffer, limit):
                         timed_out = True
                         await self._stop(f"the cell ran past its {limit:.1f}s budget")
                 except (KernelError, FrameError, OSError):
@@ -465,18 +486,72 @@ class ProcessKernel:
                         raise
             finally:
                 self._pending.pop(cell_id, None)
+                if self._running_buffer is buffer:
+                    self._running_buffer = None
                 self._cells_run += 1
             if timed_out:
+                waited = buffer.host_seconds
+                credited = min(waited, MAX_CREDITED_HOST_SECONDS)
+                host_note = (
+                    f" {waited:.1f}s of that wall clock was the host answering "
+                    f"llm_query()/rlm_query() calls, of which {credited:.1f}s is not counted "
+                    "against the cell."
+                    if waited >= 1.0
+                    else ""
+                )
                 return buffer.result(
                     timed_out=True,
                     state_lost=True,
                     error=(
                         f"the cell ran past its {limit:.1f}s budget and the kernel process was "
                         "killed; a Python cell cannot be interrupted any other way, so nothing "
-                        "that cell bound survives"
+                        f"that cell bound survives.{host_note}"
                     ),
                 )
             return buffer.result(state_lost=buffer.state_lost, cancelled=buffer.cancelled)
+
+    async def _await_cell(self, buffer: _CellBuffer, limit: float) -> bool:
+        """Wait for the done frame, budgeting the cell rather than the host.
+
+        ``limit`` is the cell's budget, and a cell's budget measures the cell. The wall
+        clock it used to cover also contained time the cell spent blocked inside
+        ``llm_query()`` / ``rlm_query()`` while the host ran a provider turn or a whole
+        child kernel: charging that to the cell killed cells that had never overrun their
+        own code, and since recursion is serial it did so predictably. The wait is
+        therefore re-armed in slices against ``limit`` plus the host time credited back to
+        this cell, capped at ``MAX_CREDITED_HOST_SECONDS`` so a wedged handler cannot keep
+        a cell open forever.
+
+        Returns ``True`` when the cell answered and ``False`` when it ran past its budget.
+        """
+
+        started = time.monotonic()
+        while True:
+            credited = min(buffer.host_seconds, MAX_CREDITED_HOST_SECONDS)
+            remaining = limit + credited - (time.monotonic() - started)
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(buffer.done.wait(), min(remaining, CELL_AWAIT_SLICE_SECONDS))
+            except TimeoutError:
+                continue
+            return True
+
+    async def _served(self, serve: Awaitable[dict[str, Any]]) -> dict[str, Any]:
+        """Answer a request from inside a cell and credit the wall clock to the host.
+
+        The kernel process cannot interrupt a Python cell, so killing on overrun is the
+        only remedy available and the budget has to point at the right culprit: the time
+        spent serving the cell is not the cell's fault and is not charged to it.
+        """
+
+        started = time.monotonic()
+        try:
+            return await serve
+        finally:
+            buffer = self._running_buffer
+            if buffer is not None:
+                buffer.host_seconds += time.monotonic() - started
 
     async def state(self) -> KernelState:
         """Inventory bound names and sizes, never their values."""
@@ -601,7 +676,7 @@ class ProcessKernel:
                     buffer.finish(frame)
                     buffer.done.set()
             elif op in (OP_SUBCALL, OP_SUBCALL_BATCHED):
-                reply = await self._serve_subcall(frame)
+                reply = await self._served(self._serve_subcall(frame))
                 try:
                     await write_frame(
                         writer,
@@ -611,7 +686,7 @@ class ProcessKernel:
                     await self._stop(f"the sub-call reply never reached the kernel: {exc}")
                     return
             elif op in (OP_RLM, OP_RLM_BATCHED):
-                reply = await self._serve_recursion(frame)
+                reply = await self._served(self._serve_recursion(frame))
                 try:
                     await write_frame(
                         writer,
@@ -621,7 +696,7 @@ class ProcessKernel:
                     await self._stop(f"the recursion reply never reached the kernel: {exc}")
                     return
             elif op == OP_CONTEXT:
-                reply = await self._serve_context(frame)
+                reply = await self._served(self._serve_context(frame))
                 try:
                     await write_frame(
                         writer,

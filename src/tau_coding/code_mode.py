@@ -101,7 +101,8 @@ _REPL_DESCRIPTION = (
     "binds existing files into the namespace as paths to open, so their bytes "
     "never enter the prompt, and context_index()/context_open(refs) do the same "
     "for the session's own history. A cell that exceeds its timeout is killed, "
-    "which also discards the namespace."
+    "which also discards the namespace; the budget measures your code, not how long "
+    "llm_query/rlm_query take."
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"

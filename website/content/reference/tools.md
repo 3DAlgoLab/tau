@@ -127,7 +127,7 @@ Runs Python in a kernel that stays alive for the whole session.
 | --- | --- | --- | --- |
 | `code` | yes | string | Python to run. Statements print nothing implicitly: use `print()` to show something, `ret({...})` to return data. |
 | `description` | yes | string | Short summary of what the cell does. |
-| `timeout` | no | number | Per-cell budget in seconds (default 30). Overrunning kills the cell **and its namespace**. |
+| `timeout` | no | number | Per-cell budget in seconds (default 30). It measures the cell's own code: time spent inside `llm_query`/`rlm_query` belongs to the host and is not charged. Overrunning kills the cell **and its namespace**. |
 | `attach` | no | object | `{"name": "path"}`: bind existing files in the namespace as **paths** to open. Names must be Python identifiers; paths may be relative to the session cwd. Contents stay on disk. |
 
 Names bound in one call -- variables, imports, functions, objects -- are still

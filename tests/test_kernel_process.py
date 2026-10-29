@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tau_coding.kernel import process as process_module
 from tau_coding.kernel.frames import encode_frame
 from tau_coding.kernel.process import MAX_CONTEXT_INDEX_BYTES, ProcessKernel, looks_secret
 from tau_coding.kernel.protocol import KernelLimits, KernelRejectedError, SubcallOutcome
@@ -144,6 +145,93 @@ async def test_one_failing_subcall_leaves_a_hole_not_a_crash(tmp_path: Path) -> 
         assert "sub-call failed" in (single.error or "")
         assert "no route for" in (single.error or "")
         assert kernel.alive
+
+
+class _SlowSubcall:
+    """Answers like a provider would: correctly, and not instantly."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+        self.calls = 0
+
+    async def __call__(self, prompt: str, model: str | None) -> SubcallOutcome:
+        self.calls += 1
+        await asyncio.sleep(self._delay)
+        return SubcallOutcome(text=f"<<{prompt}>>", model=model or "fake", metadata={})
+
+
+class _SlowRecursion:
+    """A child kernel takes turns, and turns take time."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+        self.calls = 0
+
+    async def __call__(self, task: str, model: str | None) -> SubcallOutcome:
+        self.calls += 1
+        await asyncio.sleep(self._delay)
+        return SubcallOutcome(text=f"<<{task}>>", model=model or "fake", metadata={})
+
+
+async def test_the_host_model_latency_is_not_charged_to_the_cell(tmp_path: Path) -> None:
+    """A cell is billed for its own code, not for how long the provider takes.
+
+    Two *sequential* sub-calls served in 0.6 s each used to kill a 1 s cell with
+    ``timed_out``/``state_lost`` and take the namespace down with them, even though
+    the cell never ran past its own code. Recursion is serial by construction, so
+    on the 30 s default a handful of slow turns did the same thing to a real run.
+    """
+
+    slow = _SlowSubcall(0.6)
+    async with _running(tmp_path, subcall=slow) as kernel:
+        warm = await kernel.execute("corpus = 'x' * 10\nprint('ready')")
+        assert warm.ok
+
+        cell = await kernel.execute(
+            'a = llm_query("one")\nb = llm_query("two")\nprint(len(a), len(b))', timeout=1.0
+        )
+        assert cell.ok, cell.error
+        assert not cell.timed_out and not cell.state_lost
+        assert cell.stdout == "7 7\n"
+        assert slow.calls == 2
+
+        survivor = await kernel.execute("print(len(corpus))")
+        assert survivor.ok
+        assert survivor.stdout == "10\n"
+
+
+async def test_a_childs_turns_are_not_charged_to_the_parents_cell(tmp_path: Path) -> None:
+    slow = _SlowRecursion(0.6)
+    async with _running(tmp_path, rlm=slow) as kernel:
+        cell = await kernel.execute(
+            'first = rlm_query("scan")\nsecond = rlm_query("verify")\nprint(first, second)',
+            timeout=1.0,
+        )
+        assert cell.ok, cell.error
+        assert not cell.timed_out and not cell.state_lost
+        assert cell.stdout == "<<scan>> <<verify>>\n"
+        assert slow.calls == 2
+
+
+async def test_host_time_is_credited_only_up_to_a_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credit keeps a cell alive, it does not make it immortal."""
+
+    monkeypatch.setattr(process_module, "MAX_CREDITED_HOST_SECONDS", 0.5)
+    slow = _SlowSubcall(0.6)
+    async with _running(tmp_path, subcall=slow) as kernel:
+        cell = await kernel.execute(
+            'a = llm_query("one")\n'
+            'b = llm_query("two")\n'
+            'c = llm_query("three")\n'
+            'd = llm_query("four")\n'
+            "print(a, b, c, d)",
+            timeout=1.0,
+        )
+        assert not cell.ok
+        assert cell.timed_out and cell.state_lost
+        assert "not counted" in (cell.error or "")
 
 
 async def test_a_kernel_without_a_subcall_handler_says_so(tmp_path: Path) -> None:
