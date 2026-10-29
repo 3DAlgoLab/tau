@@ -91,3 +91,10 @@ Still open in this track: an inline TUI affordance to expand omitted content fro
 its `[entry ...]` pointer, a carry-forward entry type (the renderer already
 accepts `carry_lines`), and the built-in engine selector if extension scope turns
 out to be too tight.
+
+## Next
+
+The compaction folds address omitted content by entry id. Making that address
+*dereferenceable by model code* -- slice the log, grep it, expand a fold in a
+kernel rather than re-asking a provider -- is the code-mode track: see
+[Code-Mode Kernel (Phase 2a)](./code-mode-kernel.md).
