@@ -162,13 +162,19 @@ model decided matters comes back. Inside a cell:
   bytes. The session binds the context -- not the tool call -- so a cell can ask
   about the transcript it is standing in without paying for the transcript.
 
-`install` writes into a directory keyed to the kernel's interpreter
-(`~/.tau/kernel-site/<implementation>-<version>/`), so an environment built in one
-session is still there after a kernel kill, a compaction, or the session ending --
-durability a namespace cannot offer, since a kernel restart discards every bound
-name. It is keyed to the interpreter on purpose: an environment built for one ABI
-is not handed to another. Tau prefers `uv` when it is on the machine and falls
-back to that interpreter's own `pip`, and it never installs without being asked.
+`install` writes into a directory keyed to the session's project and then to the
+kernel's interpreter (`~/.tau/kernel-site/<project>/<implementation>-<version>/`),
+so an environment built in one session is still there after a kernel kill, a
+compaction, or the session ending -- durability a namespace cannot offer, since a
+kernel restart discards every bound name. Both keys are deliberate: an environment
+built for one ABI is not handed to another, and a project's packages stay that
+project's disk usage instead of one shared pile every session inherits. The project
+is the repository root when the session starts inside one, so launching Tau from a
+subdirectory does not start a second environment. One project and interpreter share
+a 2 GiB budget; past it `install` refuses and names the directory, which is a cache
+you own and can delete. Tau prefers `uv` when it is on the machine and falls back to
+that interpreter's own `pip`. It never installs without being asked, and it never
+removes anything: pruning is yours.
 
 The kernel is a separate Python process with no provider credentials in its
 environment and byte-bounded output. That boundary keeps model-written code from

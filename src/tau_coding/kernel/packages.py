@@ -16,6 +16,13 @@ is a directory the user can delete, and a different interpreter gets its own --
 while still surviving a kernel restart, because the directory outlives the child
 process.
 
+A project gets its own copy of that directory. The environment follows where
+the session started -- the repository root when it starts inside one, so running
+Tau from a subdirectory is navigation rather than a decision to build a second
+numpy -- because one machine-wide environment makes every session's packages
+everyone's problem: it grows without bound, and one project's pinned version
+quietly becomes another project's constraint.
+
 The directory is keyed by implementation and minor version because wheels are:
 a cp313 build imported by a 3.12 kernel fails in a way that reads like a bug in
 the package rather than a mismatch the host created.
@@ -24,6 +31,10 @@ the package rather than a mismatch the host created.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import os
+import re
 import shutil
 import time
 from collections.abc import Sequence
@@ -32,15 +43,22 @@ from pathlib import Path
 
 __all__ = [
     "DEFAULT_INSTALL_TIMEOUT_SECONDS",
-    "DEFAULT_INSTALL_TIMEOUT_SECONDS",
+    "DEFAULT_SITE_LIMIT_BYTES",
     "MAX_INSTALL_OUTPUT_BYTES",
     "MAX_SPEC_CHARS",
     "MAX_SPECS",
+    "PROJECT_KEY_DIGEST_CHARS",
+    "PROJECT_KEY_LABEL_CHARS",
     "InstallReport",
     "InterpreterInfo",
     "PackageInstallError",
     "PackageInstaller",
+    "format_site_bytes",
     "probe_interpreter",
+    "project_root",
+    "project_site_base",
+    "project_site_key",
+    "site_usage_bytes",
     "validate_specs",
 ]
 
@@ -51,6 +69,12 @@ DEFAULT_INSTALL_TIMEOUT_SECONDS = 180.0
 # says the budget ran out instead of pretending another attempt was possible.
 MIN_RESOLVER_ATTEMPT_SECONDS = 1.0
 MAX_INSTALL_OUTPUT_BYTES = 8 * 1024
+# One project, one interpreter, one budget. A package environment is a cache the
+# user owns; an install that can never be refused is how a cache becomes a disk
+# full of projects nobody works on any more.
+DEFAULT_SITE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+PROJECT_KEY_DIGEST_CHARS = 8
+PROJECT_KEY_LABEL_CHARS = 32
 
 _PROBE_SNIPPET = (
     "import sys; "
@@ -78,6 +102,95 @@ class InterpreterInfo:
     def site_dir(self, base: Path) -> Path:
         """Return the version-keyed package directory under ``base``."""
         return base / f"{self.implementation}-{self.version}"
+
+
+def format_site_bytes(count: int) -> str:
+    """Render a site-directory size the way the refusal has to read it.
+
+    Byte-exact is noise at gigabyte scale and MiB-exact is a lie at kilobyte
+    scale -- "0 MiB over the 0 MiB budget" tells the reader nothing, and the
+    reader is the one who has to decide what to delete.
+    """
+
+    if count < 1024:
+        return f"{count} B"
+    if count < 1024 * 1024:
+        return f"{count // 1024} KiB"
+    if count < 1024 * 1024 * 1024:
+        return f"{count / (1024 * 1024):.1f} MiB"
+    return f"{count / (1024 * 1024 * 1024):.1f} GiB"
+
+
+def project_root(cwd: Path) -> Path:
+    """Return the directory a project's package environment follows.
+
+    A repository worktree root when the session started inside one: running Tau
+    from a subdirectory is how a person navigates, not a decision to build a
+    second copy of numpy. Outside a repository the starting directory is the
+    project, which is what the user named by choosing it.
+    """
+
+    resolved = cwd.expanduser()
+    # A starting point that cannot be resolved is still a starting point: the
+    # digest of its text keeps the environment in one place either way.
+    with contextlib.suppress(OSError):
+        resolved = resolved.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return resolved
+
+
+def project_site_key(cwd: Path) -> str:
+    """Return the filesystem-safe name for one project's environment.
+
+    The digest is the point and the label is for humans: two checkouts that share
+    a directory name, or two names differing only in punctuation, have to land in
+    different places, and someone reading ``ls`` should still see which project a
+    directory belongs to.
+    """
+
+    root = project_root(cwd)
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:PROJECT_KEY_DIGEST_CHARS]
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", root.name).strip("-.")
+    return f"{label[:PROJECT_KEY_LABEL_CHARS].strip('-.') or 'project'}-{digest}"
+
+
+def project_site_base(base: Path, cwd: Path) -> Path:
+    """Return the per-project base under which one interpreter's site lives."""
+
+    return base / project_site_key(cwd)
+
+
+def site_usage_bytes(target: Path, stop_after: int) -> int:
+    """Measure ``target`` just far enough to answer a budget question.
+
+    The walk stops the moment the running total passes ``stop_after``: this is a
+    budget check, not an inventory, and an oversized environment is precisely
+    the case where walking every file would cost the most. The figure it returns
+    is therefore a floor, and the caller has to say so.
+    """
+
+    total = 0
+    pending = [target]
+    while pending:
+        try:
+            entries = list(os.scandir(pending.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                else:
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            if total > stop_after:
+                return total
+    return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +300,13 @@ class PackageInstaller:
         target: Path,
         timeout_seconds: float = DEFAULT_INSTALL_TIMEOUT_SECONDS,
         uv_executable: str | None = None,
+        site_limit_bytes: int | None = DEFAULT_SITE_LIMIT_BYTES,
     ) -> None:
         self._executable = executable
         self._target = target
         self._timeout_seconds = timeout_seconds
         self._uv_executable = uv_executable
+        self._site_limit_bytes = site_limit_bytes
 
     @property
     def target(self) -> Path:
@@ -216,6 +331,17 @@ class PackageInstaller:
     async def install(self, specs: Sequence[object]) -> InstallReport:
         """Install ``specs``, trying each resolver in turn."""
         checked = validate_specs(specs)
+        limit = self._site_limit_bytes
+        if limit is not None:
+            used = site_usage_bytes(self._target, limit)
+            if used > limit:
+                raise PackageInstallError(
+                    f"the package environment at {self._target} holds at least "
+                    f"{format_site_bytes(used)}, over the "
+                    f"{format_site_bytes(limit)} budget for one project and "
+                    "interpreter; this is a cache the user owns, so it has to be "
+                    "pruned from outside the kernel rather than installed over"
+                )
         try:
             self._target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:

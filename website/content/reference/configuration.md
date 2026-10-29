@@ -86,8 +86,8 @@ automatically.
 kernel runs on Tau's own interpreter unless this names another one -- a command
 name or an absolute path resolved on this machine. Naming one is an ABI decision:
 the kernel asks the interpreter what it is before starting, refuses to start if it
-cannot answer, and keeps the package environment of each interpreter separate
-(see [Tools](/reference/tools/)). `null` or a blank value returns to Tau's own
+cannot answer, and keeps the package environment of each interpreter separate, inside a directory
+scoped to the session's project (see [Tools](/reference/tools/)). `null` or a blank value returns to Tau's own
 interpreter. Tau does not install interpreters; if the name is not on this
 machine, the tool reports that instead of picking a substitute.
 

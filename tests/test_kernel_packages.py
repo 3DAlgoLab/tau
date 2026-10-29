@@ -11,18 +11,25 @@ sequences on purpose: they are written verbatim into files and executed.
 from __future__ import annotations
 
 import stat
+import string
 import sys
 from pathlib import Path
 
 import pytest
 
+from tau_agent.session import JsonlSessionStorage
+from tau_ai import FakeProvider
 from tau_coding.kernel.packages import (
     MAX_SPECS,
     PackageInstaller,
     PackageInstallError,
     probe_interpreter,
+    project_root,
+    project_site_key,
+    site_usage_bytes,
     validate_specs,
 )
+from tau_coding.session import CodingSessionConfig, _kernel_site_base
 
 pytestmark = pytest.mark.anyio
 
@@ -268,3 +275,124 @@ async def test_the_site_directory_survives_a_failed_install(tmp_path: Path) -> N
 
     assert not report.ok
     assert (tmp_path / "site").is_dir()
+
+
+def test_project_root_prefers_the_repository_over_the_starting_directory(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git" / "refs").mkdir(parents=True)
+    nested = repo / "src" / "tau_coding"
+    nested.mkdir(parents=True)
+
+    assert project_root(nested) == repo.resolve()
+
+
+def test_project_root_is_the_starting_directory_outside_a_repository(tmp_path: Path) -> None:
+    plain = tmp_path / "scratch"
+    plain.mkdir()
+
+    assert project_root(plain) == plain.resolve()
+
+
+def test_project_site_key_separates_two_checkouts_with_the_same_name(tmp_path: Path) -> None:
+    first = tmp_path / "tau-dev"
+    second = tmp_path / "worktrees" / "tau-dev"
+    first.mkdir()
+    second.mkdir(parents=True)
+
+    first_key, second_key = project_site_key(first), project_site_key(second)
+
+    assert first_key.startswith("tau-dev-")
+    assert second_key.startswith("tau-dev-")
+    assert first_key != second_key
+    # A key derived from path text alone is stable across processes and restarts.
+    assert project_site_key(Path(str(first))) == first_key
+
+
+def test_project_site_key_keeps_the_label_filesystem_safe(tmp_path: Path) -> None:
+    odd = tmp_path / 'we ird!!na"me'
+    odd.mkdir()
+
+    key = project_site_key(odd)
+    label = key.rsplit("-", 1)[0]
+
+    assert set(label) <= set(string.ascii_letters + string.digits + "._-")
+    assert label.endswith("na-me")
+
+
+def test_site_usage_bytes_totals_the_tree_and_bails_past_the_budget(tmp_path: Path) -> None:
+    site = tmp_path / "cpython-3.13"
+    site.mkdir()
+    (site / "top.py").write_bytes(b"x" * 1000)
+    nested = site / "numpy"
+    nested.mkdir()
+    (nested / "core.py").write_bytes(b"y" * 4000)
+
+    assert site_usage_bytes(site, 10**6) == 5000
+    assert site_usage_bytes(site, 100) > 100
+    assert site_usage_bytes(tmp_path / "absent", 10**6) == 0
+
+
+async def test_install_refuses_an_over_budget_environment_without_a_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget is checked before any resolver runs, so refusal has no side effects."""
+
+    site = tmp_path / "cpython-3.13"
+    site.mkdir()
+    (site / "blob.py").write_bytes(b"z" * 4096)
+
+    async def never_started(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a resolver ran despite the budget")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", never_started)
+
+    installer = PackageInstaller(
+        executable=sys.executable,
+        target=site,
+        site_limit_bytes=2048,
+    )
+    with pytest.raises(PackageInstallError, match="budget") as raised:
+        await installer.install(["numpy"])
+
+    # The reader has to decide what to delete, so the numbers have to be real.
+    assert "at least" in str(raised.value)
+    assert "KiB" in str(raised.value)
+    assert "2 KiB budget" in str(raised.value)
+
+    assert (site / "blob.py").read_bytes() == b"z" * 4096
+
+
+def test_the_configured_base_is_scoped_to_the_session_project(tmp_path: Path) -> None:
+    """The session puts the project between the base and the interpreter key."""
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    base = tmp_path / "kernel-site"
+    provider = FakeProvider([])
+    storage = JsonlSessionStorage(tmp_path / "store")
+    config = CodingSessionConfig(
+        provider=provider,
+        model="fake",
+        system="You are Tau.",
+        storage=storage,
+        cwd=repo / "src",
+        code_mode_package_site_dir=base,
+    )
+
+    site_base = _kernel_site_base(config)
+
+    assert site_base is not None
+    assert site_base.parent == base
+    assert site_base.name.startswith("repo-")
+
+    nested = CodingSessionConfig(
+        provider=provider,
+        model="fake",
+        system="You are Tau.",
+        storage=storage,
+        cwd=repo,
+        code_mode_package_site_dir=None,
+    )
+
+    assert _kernel_site_base(nested) is None

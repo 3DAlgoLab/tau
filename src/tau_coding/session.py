@@ -94,6 +94,7 @@ from tau_coding.extensions.api import BeforeCompactEvent, CompactionContextEntry
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
+from tau_coding.kernel.packages import project_site_base
 from tau_coding.kernel.process import ProcessKernel
 from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.last_model import remember_last_model
@@ -252,6 +253,23 @@ def _turn_ends_on_tool_calls(event: TurnEndEvent) -> bool:
     """
     message = event.message
     return isinstance(message, AssistantMessage) and bool(message.tool_calls)
+
+
+def _kernel_site_base(config: CodingSessionConfig) -> Path | None:
+    """Return the package environment this session's kernel gets, or None for none.
+
+    Two levels deep on purpose: the project the session started in, then the
+    interpreter's key inside it. Project scoping is what keeps a package
+    environment a project's problem -- an environment that grows with use stops
+    being one cache shared by every checkout, and a version one project pinned
+    stops being a constraint another project inherited without being asked.
+
+    The configured base names the whole collection; the project and interpreter
+    directories beneath it are Tau's to create and the user's to delete.
+    """
+
+    base = config.code_mode_package_site_dir
+    return None if base is None else project_site_base(base, config.cwd)
 
 
 def _wire_code_mode_recursion(
@@ -507,10 +525,13 @@ class CodingSessionConfig:
     )
     """Base for the kernel's installed packages, or ``None`` for no environment.
 
-    A kernel uses a child directory keyed to its interpreter's implementation and
-    minor version, created on first use and put on the child's ``PYTHONPATH``.
-    Installs live in a directory rather than in the interpreter, so they survive
-    a killed kernel, a restart of Tau, and a user who wants them gone.
+    A kernel uses a directory keyed first to the project the session started in
+    -- the repository root when it starts inside one -- and then to the
+    interpreter's implementation and minor version. It is created on first use and
+    put on the child's ``PYTHONPATH``. Installs live in a directory rather than in
+    the interpreter, so they survive a killed kernel, a restart of Tau, and a user
+    who wants them gone; they are scoped to a project so that a cache which grows
+    with use is that project's disk usage rather than one shared pile.
     """
     skills_enabled: bool = True
     """Whether skill discovery is enabled for this session.
@@ -861,7 +882,7 @@ class CodingSession:
                 cwd=config.cwd,
                 recursion_enabled=config.code_mode_recursion_enabled,
                 python_executable=config.code_mode_python,
-                package_site_base=config.code_mode_package_site_dir,
+                package_site_base=_kernel_site_base(config),
             )
         )
         if code_mode is not None:
@@ -924,7 +945,7 @@ class CodingSession:
                     cwd=config.cwd,
                     max_depth=config.code_mode_rlm_max_depth,
                     python_executable=config.code_mode_python,
-                    package_site_base=config.code_mode_package_site_dir,
+                    package_site_base=_kernel_site_base(config),
                 )
         if previous_runtime is not None:
             extension_runtime.set_ui_bridge(previous_runtime.ui)
@@ -2629,7 +2650,7 @@ class CodingSession:
                 cwd=self._config.cwd,
                 recursion_enabled=self._config.code_mode_recursion_enabled,
                 python_executable=self._config.code_mode_python,
-                package_site_base=self._config.code_mode_package_site_dir,
+                package_site_base=_kernel_site_base(self._config),
             )
             bridge = SubcallBridge(
                 provider=lambda: self._harness.config.provider,
@@ -2643,7 +2664,7 @@ class CodingSession:
                     cwd=self._config.cwd,
                     max_depth=self._config.code_mode_rlm_max_depth,
                     python_executable=self._config.code_mode_python,
-                    package_site_base=self._config.code_mode_package_site_dir,
+                    package_site_base=_kernel_site_base(self._config),
                 )
             self._code_mode.bind_context(ContextEntries(rows=self._active_context_rows))
         return self._code_mode.tool()
