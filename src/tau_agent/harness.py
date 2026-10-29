@@ -103,7 +103,9 @@ class AgentHarness:
         self._messages.append(message)
 
     def replace_messages(self, messages: Sequence[AgentMessage]) -> None:
-        self._messages = list(messages)
+        # Replace in place: an in-flight agent loop holds a reference to this
+        # same list and must observe the replacement on its next request.
+        self._messages[:] = list(messages)
 
     def subscribe(self, listener: EventListener) -> Callable[[], None]:
         self._listeners.append(listener)

@@ -4099,6 +4099,113 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
 
 
 @pytest.mark.anyio
+async def test_session_auto_compacts_mid_turn_when_tool_turns_cross_threshold(
+    tmp_path: Path,
+) -> None:
+    # A single autonomous turn (no new user prompt) grows past the
+    # compaction threshold; compaction must fire mid-turn, after the tool
+    # results that crossed it are appended, and the in-flight loop must
+    # start its next request from the compacted context.
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    for name in ("A.md", "B.md", "C.md"):
+        (tmp_path / name).write_text("x" * 47_500, encoding="utf-8")
+
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=[ToolCall(id="call-1", name="read", arguments={"path": "A.md"})]
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=[ToolCall(id="call-2", name="read", arguments={"path": "B.md"})]
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=[ToolCall(id="call-3", name="read", arguments={"path": "C.md"})]
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Generated automatic summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done.")),
+            ],
+        ]
+    )
+
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+        )
+    )
+
+    # Set the threshold above the system+tools baseline but below the
+    # context after the third tool result.
+    baseline = session.context_token_estimate
+    session._auto_compact_token_threshold = baseline + 25_000
+
+    _events = await _collect_session_events(session.prompt("Do it now."))
+
+    entries = await storage.read_all()
+    rows = [entry for entry in entries if entry.type in {"message", "compaction"}]
+    assert [entry.type for entry in rows] == [
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "compaction",
+        "message",
+    ]
+
+    user_entry, first_call, result_a, second_call, result_b, third_call, result_c, mid, final = rows
+    del user_entry, first_call, result_a, second_call, result_b, result_c, final
+
+    compactions = [entry for entry in entries if entry.type == "compaction"]
+    assert len(compactions) == 1
+    assert mid.summary == "Generated automatic summary"
+    # The kept window starts at the third assistant turn (tool results are
+    # never kept without their call); everything before it, including the
+    # second large result, is summarized.
+    assert mid.first_kept_entry_id == third_call.id
+    assert mid.tokens_before is not None
+    assert mid.tokens_before > 0
+
+    # The summary request summarized the original prompt.
+    assert "Do it now." in provider.calls[3][2][0].content
+
+    # The in-flight loop must observe the replacement: the next assistant
+    # request starts from the summary, not the original prompt.
+    first_message = provider.calls[4][2][0]
+    assert isinstance(first_message, UserMessage)
+    assert first_message.text == ("Previous conversation summary:\nGenerated automatic summary")
+    assert not any(
+        isinstance(message, UserMessage) and message.text == "Do it now."
+        for message in provider.calls[4][2]
+    )
+
+
+@pytest.mark.anyio
 async def test_before_compact_hook_replaces_summary_without_provider_call(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

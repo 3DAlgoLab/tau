@@ -11,7 +11,13 @@ from os import environ
 from pathlib import Path
 from typing import Literal
 
-from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
+from tau_agent.events import (
+    AgentEndEvent,
+    AgentEvent,
+    MessageEndEvent,
+    ToolExecutionEndEvent,
+    TurnEndEvent,
+)
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
     AgentMessage,
@@ -3627,6 +3633,12 @@ class CodingSession:
                     auto_name_message = event.message.text
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
+                if isinstance(event, TurnEndEvent) and event.message.tool_calls:
+                    self._invalidate_context_usage_cache()
+                    # Long tool turns can cross the compaction threshold with
+                    # no user prompt in between; compact mid-turn so the next
+                    # assistant request starts below the limit.
+                    await self._try_auto_compact(context=context, phase="auto_compact_mid_turn")
                 if (
                     isinstance(event, MessageEndEvent)
                     and isinstance(event.message, AssistantMessage)
@@ -3690,6 +3702,15 @@ class CodingSession:
                     async for retry_event in events:
                         if isinstance(retry_event, ToolExecutionEndEvent):
                             self._invalidate_context_usage_cache()
+                        if isinstance(retry_event, TurnEndEvent) and retry_event.message.tool_calls:
+                            self._invalidate_context_usage_cache()
+                            # Long tool turns can cross the compaction threshold
+                            # with no user prompt in between; compact mid-turn
+                            # so the next assistant request starts below the
+                            # limit.
+                            await self._try_auto_compact(
+                                context=context, phase="auto_compact_mid_turn"
+                            )
                         if (
                             isinstance(retry_event, MessageEndEvent)
                             and isinstance(retry_event.message, AssistantMessage)
@@ -3762,6 +3783,12 @@ class CodingSession:
             async for event in events:
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
+                if isinstance(event, TurnEndEvent) and event.message.tool_calls:
+                    self._invalidate_context_usage_cache()
+                    # Long tool turns can cross the compaction threshold with
+                    # no user prompt in between; compact mid-turn so the next
+                    # assistant request starts below the limit.
+                    await self._try_auto_compact(context=context, phase="auto_compact_mid_turn")
                 if (
                     isinstance(event, MessageEndEvent)
                     and isinstance(event.message, AssistantMessage)
