@@ -3117,6 +3117,34 @@ class CodingSession:
             return None
         return updated.title or normalized
 
+    def _new_session_pair_is_carriable(self, provider_name: str | None, model: str) -> bool:
+        """Can the provider/model this session runs on still be named after a reset?
+
+        ``/new`` clears the transcript, not the user's choice of model. The pair
+        in force carries over; only a pair the settings can no longer name
+        (provider entry removed, or a provider that lists models and no longer
+        lists this one) falls back to the settings default. Re-resolving
+        unconditionally used to send every ``/new`` to the provider catalog's
+        default, which on a machine whose default provider holds no credentials
+        failed as "Missing provider API key. Set OPENAI_API_KEY or run /login
+        openai."
+        """
+        if not provider_name or not model:
+            return False
+        if self._active_dynamic_provider is not None:
+            # An extension or account provider carries its own inventory; the
+            # dynamic branch below re-picks the model from it.
+            return True
+        provider = self._runtime_provider_config
+        if provider is not None and provider.name == provider_name:
+            # The config this session actually resolved against, runtime model
+            # catalogs included.
+            return True
+        configured = self.provider_config(provider_name)
+        if configured is None:
+            return False
+        return not configured.models or model in configured.models
+
     async def new_session(self) -> str:
         """Replace this session's active state with a pending unindexed session."""
         self._require_idle("start a new session")
@@ -3129,7 +3157,11 @@ class CodingSession:
         model = self._harness.config.model
         runtime_provider_config = self._runtime_provider_config
         thinking_level = self._thinking_level
-        if self._provider_settings is not None:
+        if self._provider_settings is not None and not self._new_session_pair_is_carriable(
+            provider_name, model
+        ):
+            # Nothing left to carry over, so fall back to what a fresh start
+            # would pick.
             selection = resolve_provider_selection(self._provider_settings)
             provider_name = selection.provider.name
             model = selection.model

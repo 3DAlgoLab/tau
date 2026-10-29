@@ -66,6 +66,26 @@ provider default_model      unchanged behaviour
   always ignored them, so a settings.json written by a newer Tau used to lose
   its own keys the first time an older Tau wrote a flag into the same file.
 
+## `/new` keeps the pair
+
+`CodingSession.new_session()` used to call `resolve_provider_selection(settings)`
+with no provider and no model, i.e. the provider catalog's default. On a machine
+whose default provider holds no credentials — the case above, where `openai` is
+the default and the working pair is `dpi2/coder2` — every `/new` (TUI) and
+`new_session` (RPC) failed with "Missing provider API key. Set `OPENAI_API_KEY`
+or run `/login openai.`": the user cleared the transcript and was thrown onto a
+provider they never chose.
+
+Now the pair in force carries over. The settings default is used only when the
+pair can no longer be named at all: the provider entry was deleted, or a provider
+that lists models no longer lists this one. An extension or account provider
+carries its own inventory, so it is carriable by definition and the dynamic branch
+in `new_session` re-picks the model from it; a provider with an empty `models`
+tuple is carriable for the same reason.
+
+`/new` clears the transcript, not the user's choice of model. To change the
+model, use `/model`; to re-read provider settings, restart or `/reload`.
+
 ## Verified on a real machine
 
 `tau -p --mode json --provider dpi2 -m coder2` wrote
@@ -73,3 +93,14 @@ provider default_model      unchanged behaviour
 following bare `tau -p --mode json` streamed 48 events carrying
 `"provider": "dpi2"`, `"model": "coder2"`, and the session index recorded the
 same pair.
+
+`/new` before and after, same real home, through `tau --mode rpc` with
+`get_state` → `new_session` → `get_state`:
+
+```text
+HEAD~ (the jump):      {"id":"2","command":"new_session","success":false,
+                        "error":"Missing provider API key. Set OPENAI_API_KEY or
+                        run /login openai."}
+with the fix:         {"id":"2","command":"new_session","success":true}
+                      get_state before/after: model.id "coder2", provider "dpi2"
+```

@@ -9,7 +9,7 @@ command palette with **Ctrl+K**.
 | Command | Description |
 | --- | --- |
 | `/quit` | Exit the session |
-| `/new` | Start a new session |
+| `/new` | Start a new session, keeping the current provider and model |
 | `/session` | Show session info and stats (model, cwd, tools, skills, context) |
 | `/system` | Show the active system prompt grouped by source without adding it to context or session history |
 | `/compact [instructions]` | Summarize and compact the active context |

@@ -6814,7 +6814,7 @@ async def test_session_set_model_preserves_newer_provider_file_changes(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("owns_initial_provider", [False, True])
-async def test_session_new_session_uses_default_provider_model(
+async def test_session_new_session_keeps_the_provider_and_model_in_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owns_initial_provider: bool
 ) -> None:
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
@@ -6875,13 +6875,76 @@ async def test_session_new_session_uses_default_provider_model(
 
     message = await session.new_session()
 
+    # ``openai`` here stands for the machine's default provider, which the user
+    # never chose: clearing the transcript must not jump the session onto it.
     assert message.startswith("Started new session: ")
+    assert session.provider_name == "openrouter"
+    assert session.model == "openai/gpt-5.5"
+    assert manager.get_session(session.session_id) is None
+    assert created == [("openrouter", "openai/gpt-5.5")]
+    assert session.provider is not old_provider
+    assert session.provider.config.name == "openrouter"
+
+
+@pytest.mark.anyio
+async def test_session_new_session_falls_back_when_the_provider_entry_is_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    current_record = manager.create_session(
+        cwd=tmp_path,
+        model="openai/gpt-5.5",
+        provider_name="openrouter",
+    )
+    # The openrouter entry has since been deleted from the durable settings, so
+    # there is nothing to carry over and the settings default takes over.
+    settings = ProviderSettings(
+        default_provider="openai",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="openai",
+                models=("gpt-5",),
+                default_model="gpt-5",
+            ),
+        ),
+    )
+    created: list[tuple[str, str | None]] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+        inference_provider: str | None = None,
+    ) -> SwitchableFakeProvider:
+        del credential_store, thinking_level, inference_provider
+        created.append((provider_config.name, model))  # type: ignore[attr-defined]
+        return SwitchableFakeProvider(provider_config)
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=SwitchableFakeProvider(
+                OpenAICompatibleProviderConfig(name="openrouter", models=("openai/gpt-5.5",))
+            ),
+            model="openai/gpt-5.5",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(current_record.path),
+            cwd=current_record.cwd,
+            session_id=current_record.id,
+            session_manager=manager,
+            provider_name="openrouter",
+            provider_settings=settings,
+        )
+    )
+    created.clear()
+
+    _message = await session.new_session()
+
     assert session.provider_name == "openai"
     assert session.model == "gpt-5"
-    assert manager.get_session(session.session_id) is None
     assert created == [("openai", "gpt-5")]
-    assert session.provider is not old_provider
-    assert session.provider.config.name == "openai"
 
 
 @pytest.mark.anyio
