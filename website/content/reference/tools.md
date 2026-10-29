@@ -128,6 +128,7 @@ Runs Python in a kernel that stays alive for the whole session.
 | `code` | yes | string | Python to run. Statements print nothing implicitly: use `print()` to show something, `ret({...})` to return data. |
 | `description` | yes | string | Short summary of what the cell does. |
 | `timeout` | no | number | Per-cell budget in seconds (default 30). Overrunning kills the cell **and its namespace**. |
+| `attach` | no | object | `{"name": "path"}`: bind existing files in the namespace as **paths** to open. Names must be Python identifiers; paths may be relative to the session cwd. Contents stay on disk. |
 
 Names bound in one call -- variables, imports, functions, objects -- are still
 bound in the next, so a 5 MB list can stay in the kernel while only the slice the
@@ -140,6 +141,9 @@ model decided matters comes back. Inside a cell:
   call the session's current model from inside the cell; a failed batch entry
   comes back as `None`. Sub-calls are given no tools, so a cell cannot start an
   agent, and each cell has a sub-call budget that a runaway loop cannot exceed.
+- `attach({"name": "path"})` on the tool call binds a file the cell can `open()`;
+  the file's bytes never enter the prompt. Handles belong to the namespace, so a
+  cell after a kernel kill must restate them.
 
 The kernel is a separate Python process with no provider credentials in its
 environment and byte-bounded output. That boundary keeps model-written code from

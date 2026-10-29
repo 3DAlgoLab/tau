@@ -72,6 +72,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [Deterministic Compaction As An Extension](./compaction-engine-extension.md)
 - [Code-Mode Kernel (Phase 2a)](./code-mode-kernel.md)
 - [Code Mode As A Session Tool (Phase 2b)](./code-mode-tool-and-subcalls.md)
+- [File Handles In The Kernel (Phase 2c-i)](./code-mode-file-handles.md)
 - [The tau-rlm Launcher](./tau-rlm-launcher.md)
 
 Phase 21 extensions are implemented; see the phase note and the user guide at

@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Mapping
+import stat
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from tau_agent.messages import TextContent
@@ -37,6 +38,7 @@ from tau_coding.kernel.protocol import (
     KernelError,
     KernelLimits,
 )
+from tau_coding.kernel.scaffold import RESERVED
 from tau_coding.kernel.subcall import (
     DEFAULT_MAX_SUBCALLS_PER_CELL,
     SubcallBridge,
@@ -59,6 +61,16 @@ DEFAULT_CELL_TIMEOUT_SECONDS = 30.0
 MAX_CODE_BYTES = 64 * 1024
 MAX_OUTPUT_LINES = 400
 MAX_OUTPUT_BYTES = 16 * 1024
+
+MAX_ATTACHED_FILE_BYTES = 2 * 1024 * 1024
+MAX_ATTACHMENTS = 16
+"""Ceilings on file handles handed to the kernel.
+
+An attached file crosses the boundary as a *path*: its bytes never enter a
+prompt. The size ceiling only stops the tool from blessing a handle a cell
+would then read whole into memory -- slice a bigger file first.
+"""
+
 """Tool-level ceiling on what a cell's text output contributes to context.
 
 The kernel caps what it captures at a larger size; this caps what the harness
@@ -82,8 +94,10 @@ _REPL_DESCRIPTION = (
     "ret(...), which arrives as JSON rather than prose. SHOW_VARS() lists bound "
     "names and their sizes without values. llm_query(prompt, model=None) and "
     "llm_query_batched(prompts, model=None) call the session's model from inside "
-    "the cell; a batched failure comes back as None. A cell that exceeds its "
-    "timeout is killed, which also discards the namespace."
+    "the cell; a batched failure comes back as None. attach({name: path}) "
+    "binds existing files into the namespace as paths to open, so their bytes "
+    "never enter the prompt. A cell that exceeds its timeout is killed, which "
+    "also discards the namespace."
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
@@ -96,6 +110,8 @@ _REPL_GUIDELINES: tuple[str, ...] = (
     "calls instead of re-reading or re-printing them.",
     "Do not print large objects to inspect them. Slice, count, and sample first, and "
     "end the cell with ret({...}) so the result comes back as data.",
+    "Attach a file with attach({name: path}) instead of pasting its contents into "
+    "the code: the bound name is a path you open inside the cell.",
     "Keep material in kernel variables and use llm_query/llm_query_batched to ask "
     "about it in chunks; bring back answers, not the corpus.",
     "A cell that overruns its timeout is killed together with its namespace, so split "
@@ -118,6 +134,17 @@ _REPL_INPUT_SCHEMA: dict[str, JSONValue] = {
             "description": (
                 f"Per-cell budget in seconds (default {DEFAULT_CELL_TIMEOUT_SECONDS:g}). "
                 "Exceeding it kills the cell and clears the namespace."
+            ),
+        },
+        "attach": {
+            "type": "object",
+            "propertyNames": {"type": "string"},
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "Files to expose in the namespace as paths, given as a mapping of "
+                'name to path, such as {"log": "tests/fixtures/app.log"}. The '
+                "name must be a Python identifier and the path may be relative to "
+                "the session cwd. Contents stay on disk: the cell opens the path."
             ),
         },
     },
@@ -221,6 +248,25 @@ class CodeMode:
             self._kernel = self._kernel_factory()
         return self._kernel
 
+    async def _attach(
+        self, kernel: Kernel, requested: Mapping[str, JSONValue]
+    ) -> list[tuple[str, int]]:
+        """Bind every requested file handle before the cell runs.
+
+        A handle is not a durable resource: a kernel killed by an overrun loses
+        its namespace, so the cell restates what it needs and this re-binds it.
+        Re-attaching unconditionally on each call makes that recovery automatic
+        instead of contingent on noticing the kernel restarted. The whole cell
+        fails -- rather than running half-attached -- because model code that
+        reads a missing name gets a confusing NameError instead of the reason
+        the handle was refused.
+        """
+
+        attached: list[tuple[str, int]] = []
+        for name, raw in requested.items():
+            attached.append(await _attach_one(kernel, self._cwd, name, raw))
+        return attached
+
     # -- execution ----------------------------------------------------------
 
     async def _execute(
@@ -241,6 +287,7 @@ class CodeMode:
             raise ToolInputError("Cell cancelled")
 
         kernel = self._kernel_or_new()
+        attachments = await self._attach(kernel, _attach_arg(arguments))
         bridge = self._subcall
         if bridge is not None:
             bridge.begin_cell(signal)
@@ -258,7 +305,7 @@ class CodeMode:
             if bridge is not None:
                 bridge.end_cell()
 
-        return _describe(result, totals, kernel, timeout=timeout)
+        return _describe(result, totals, kernel, timeout=timeout, attachments=attachments)
 
     async def _watch_cancellation(self, kernel: Kernel, signal: ToolCancellationToken) -> None:
         """Abort the cell when the harness cancels it.
@@ -291,6 +338,7 @@ def _describe(
     kernel: Kernel,
     *,
     timeout: float,
+    attachments: Sequence[tuple[str, int]] = (),
 ) -> AgentToolResult:
     blocks: list[str] = []
     output = result.stdout
@@ -315,6 +363,10 @@ def _describe(
             blocks.append(f"[ret rejected: {result.ret_error}]")
         else:
             blocks.append(f"[ret] {_as_json(result.ret)}")
+
+    if attachments:
+        rows = ", ".join(f"{name} ({format_size(size)})" for name, size in attachments)
+        blocks.append(f"[attached as paths: {rows}]")
 
     if totals is not None and totals.calls:
         parts = [f"{totals.calls} sub-call{'' if totals.calls == 1 else 's'}"]
@@ -361,6 +413,8 @@ def _describe(
             "restarts": kernel.restarts,
         },
     }
+    if attachments:
+        details["attachments"] = [{"name": name, "bytes": size} for name, size in attachments]
     if totals is not None:
         details["subcalls"] = totals.to_json()
 
@@ -392,6 +446,56 @@ def _code_arg(arguments: Mapping[str, JSONValue]) -> str:
             "namespace persists between them."
         )
     return raw
+
+
+def _attach_arg(arguments: Mapping[str, JSONValue]) -> Mapping[str, JSONValue]:
+    raw = arguments.get("attach")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ToolInputError("attach must be an object mapping a name to a file path")
+    if len(raw) > MAX_ATTACHMENTS:
+        raise ToolInputError(
+            f"attach names {len(raw)} files; the limit is {MAX_ATTACHMENTS}. "
+            "Attach what this cell reads and drop the rest -- paths persist in "
+            "the namespace across cells."
+        )
+    return raw
+
+
+async def _attach_one(kernel: Kernel, cwd: Path, name: object, raw: JSONValue) -> tuple[str, int]:
+    """Resolve one handle and bind it in the kernel; raise with the reason why not."""
+
+    if not isinstance(name, str) or not name.isidentifier():
+        raise ToolInputError(f"attach name {name!r} must be a Python identifier")
+    if name in RESERVED:
+        raise ToolInputError(
+            f"attach name {name!r} belongs to a kernel binding; choose another name"
+        )
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolInputError(f"attach path for {name!r} must be a non-empty string")
+    candidate = Path(raw)
+    path = candidate if candidate.is_absolute() else cwd / candidate
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise ToolInputError(f"attach path for {name!r} could not be read: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ToolInputError(
+            f"attach path for {name!r} is not a regular file; the kernel binds "
+            "files, not directories or devices"
+        )
+    if info.st_size > MAX_ATTACHED_FILE_BYTES:
+        raise ToolInputError(
+            f"attach path for {name!r} is {format_size(info.st_size)}; the limit is "
+            f"{format_size(MAX_ATTACHED_FILE_BYTES)}. Slice the file with bash first "
+            "-- a handle this large would be read whole inside the cell."
+        )
+    try:
+        await kernel.bind(name, path)
+    except (KernelError, FrameError, OSError) as exc:
+        raise ToolInputError(f"the kernel refused to attach {name!r}: {exc}") from exc
+    return name, info.st_size
 
 
 def _timeout_arg(arguments: Mapping[str, JSONValue], *, default: float) -> float:

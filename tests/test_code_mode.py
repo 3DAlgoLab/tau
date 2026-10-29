@@ -22,7 +22,13 @@ from tau_agent.session import JsonlSessionStorage
 from tau_agent.tools import AgentToolResult, ToolCancellationToken
 from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
-from tau_coding.code_mode import MAX_CODE_BYTES, PYTHON_REPL_TOOL_NAME, CodeMode
+from tau_coding.code_mode import (
+    MAX_ATTACHED_FILE_BYTES,
+    MAX_CODE_BYTES,
+    PYTHON_REPL_TOOL_NAME,
+    CodeMode,
+)
+from tau_coding.kernel.scaffold import RESERVED
 from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.session import CodingSession, CodingSessionConfig
 from tau_coding.session_manager import SessionManager
@@ -72,6 +78,7 @@ def test_the_tool_is_named_and_runs_sequentially(tmp_path: Path) -> None:
     assert tool.execution_mode == "sequential"
     assert tool.parameters["required"] == ["code", "description"]
     assert "timeout" in tool.parameters["properties"]
+    assert "attach" in tool.parameters["properties"]
     assert tool.prompt_guidelines
 
 
@@ -218,6 +225,70 @@ async def test_a_bad_timeout_is_refused(tmp_path: Path) -> None:
     async with _mode(cwd=tmp_path) as mode:
         with pytest.raises(ToolInputError, match="timeout"):
             await _cell(mode, "print(1)", timeout=0)
+
+
+# -- file handles (attach) --------------------------------------------------
+
+
+async def test_attach_binds_a_path_not_a_payload(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("line one\nneedle here\n", encoding="utf-8")
+    async with _mode(cwd=tmp_path) as mode:
+        result = await _cell(
+            mode,
+            "with open(corpus, encoding='utf-8') as handle:\n"
+            "    text = handle.read()\n"
+            "print([line for line in text.splitlines() if 'needle' in line])",
+            attach={"corpus": str(corpus)},
+        )
+        assert "needle here" in _text(result)
+        assert "[attached as paths: corpus (" in _text(result)
+        assert result.details["attachments"] == [
+            {"name": "corpus", "bytes": len(corpus.read_bytes())}
+        ]
+
+
+async def test_a_handle_can_be_rebound_after_the_namespace_dies(tmp_path: Path) -> None:
+    # The handle is a name in the namespace, not a durable resource, so a kernel
+    # killed by an overrun loses it and the next call must restate it.
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("kept\n", encoding="utf-8")
+    async with _mode(cwd=tmp_path) as mode:
+        first = await _cell(
+            mode, "print(open(corpus, encoding='utf-8').read())", attach={"corpus": str(corpus)}
+        )
+        assert "kept" in _text(first)
+        killed = await _cell(mode, "import time\ntime.sleep(5)", timeout=0.5)
+        assert killed.details["state_lost"] is True
+        lost = await _cell(mode, "print(open(corpus, encoding='utf-8').read())")
+        assert "NameError" in str(lost.details["error"])
+        rebound = await _cell(
+            mode, "print(open(corpus, encoding='utf-8').read())", attach={"corpus": str(corpus)}
+        )
+        assert "kept" in _text(rebound)
+
+
+async def test_a_refused_handle_fails_the_call_before_the_cell_runs(tmp_path: Path) -> None:
+    async with _mode(cwd=tmp_path) as mode:
+        with pytest.raises(ToolInputError, match="not a regular file"):
+            await _cell(mode, "print(1)", attach={"where": str(tmp_path)})
+        with pytest.raises(ToolInputError, match="identifier"):
+            await _cell(mode, "print(1)", attach={"not an id": str(tmp_path / "x.txt")})
+        with pytest.raises(ToolInputError, match="kernel binding"):
+            await _cell(mode, "print(1)", attach={RESERVED[0]: str(tmp_path / "x.txt")})
+        with pytest.raises(ToolInputError, match="could not be read"):
+            await _cell(mode, "print(1)", attach={"gone": str(tmp_path / "gone.txt")})
+        # Refused before any cell ran: the kernel object exists but executed nothing.
+        assert mode._kernel is not None and mode._kernel.cells_run == 0
+
+
+async def test_an_oversized_handle_is_named_not_loaded(tmp_path: Path) -> None:
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"x" * (MAX_ATTACHED_FILE_BYTES + 1))
+    async with _mode(cwd=tmp_path) as mode:
+        with pytest.raises(ToolInputError, match="Slice the file"):
+            await _cell(mode, "print(1)", attach={"big": str(big)})
+        assert mode._kernel is None or mode._kernel.cells_run == 0
 
 
 # -- session scope ----------------------------------------------------------
