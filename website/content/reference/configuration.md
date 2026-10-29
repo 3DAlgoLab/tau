@@ -51,7 +51,7 @@ launching `tau`.
 ├── codex-models-store.json # account-scoped Codex model snapshot
 ├── credentials.json    # saved API keys / OAuth tokens (0600, atomic writes)
 ├── state/extensions/    # built-in integration state, including llama.cpp
-├── settings.json       # general settings (trust default, shell prefix)
+├── settings.json       # general settings (trust default, shell prefix, code mode)
 ├── trust.json          # versioned project-input trust decisions
 ├── tui.json            # TUI theme, keybindings, and layout
 ├── sessions/           # saved sessions, per project
@@ -72,6 +72,14 @@ Tau also reads user-level `.agents` resources: `~/.agents/skills/`,
 policy. The default is `ask`. Interactive `ask` opens the trust modal; headless
 `ask` safely declines. `trust.json` is managed atomically by Tau; do not add
 relative paths or unknown fields. See [Project trust](/guides/project-trust/).
+
+`settings.json` may also contain `"codeMode": true | false` (default `true`).
+Code mode is the persistent `python_repl` kernel described in
+[Tools](/reference/tools/); `false` leaves the tool out of every session started
+on this machine, which is the switch for a host that wants no model-written Python
+running at all. The value is user-global, like trust: a project cannot enable or
+disable it. One-shot hosts that build their own tool list never gain the tool
+automatically.
 
 Startup update checks cache their latest PyPI result in
 `~/.tau/cache/update-check.json` and refresh at most once per day. A failed

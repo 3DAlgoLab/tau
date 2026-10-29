@@ -145,3 +145,9 @@ guarantees under test only exist at the process boundary:
   kernel;
 - ``setrlimit`` values read back from inside the child;
 - ``close`` being terminal: the pid is gone and ``state()`` says so.
+
+## Next
+
+Phase 2b wires this to a session: the ``python_repl`` tool, the host-side
+``SubcallBridge`` that answers ``llm_query`` with the session's current model, and
+the lifetime rules. See [Code Mode As A Session Tool](./code-mode-tool-and-subcalls.md).

@@ -13,6 +13,7 @@ from tau_ai import (
 )
 from tau_coding import CodingSessionRecord, SessionManager, cli
 from tau_coding.cli import app, run_print_mode
+from tau_coding.code_mode import CodeMode
 from tau_coding.paths import TauPaths
 from tau_coding.provider_config import (
     OpenAICompatibleProviderConfig,
@@ -752,14 +753,22 @@ async def test_run_print_mode_prints_final_assistant_text(
     assert captured.err == ""
     assert provider.calls[0][0] == "fake"
     resource_paths = TauResourcePaths(root=tmp_path / "resources", agents_root=None)
+    expected_tools = [*create_coding_tools(cwd=tmp_path), CodeMode(cwd=tmp_path).tool()]
     assert provider.calls[0][1] == build_system_prompt(
         BuildSystemPromptOptions(
             cwd=tmp_path,
-            tools=create_coding_tools(cwd=tmp_path),
+            tools=expected_tools,
             skills=load_skills(resource_paths),
         )
     )
-    assert [tool.name for tool in provider.calls[0][3]] == ["read", "write", "edit", "bash"]
+    # print mode starts with code mode on, like every default tool set
+    assert [tool.name for tool in provider.calls[0][3]] == [
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "python_repl",
+    ]
 
 
 @pytest.mark.anyio
@@ -820,7 +829,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     inspection = build_system_prompt_inspection(
         BuildSystemPromptOptions(
             cwd=tmp_path,
-            tools=create_coding_tools(cwd=tmp_path),
+            tools=[*create_coding_tools(cwd=tmp_path), CodeMode(cwd=tmp_path).tool()],
             skills=load_skills(TauResourcePaths(root=tmp_path / "resources", agents_root=None)),
         )
     )

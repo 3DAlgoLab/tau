@@ -115,9 +115,45 @@ of large output (truncated to 2,000 lines / 50 KB; the full output is written to
 a temp `.log` file whose path is included in the result). On POSIX, a timeout
 kills the whole process group.
 
+## `python_repl`
+
+Runs Python in a kernel that stays alive for the whole session.
+
+```json
+{ "code": "rows = parse(log)\nret({'count': len(rows)})", "description": "Counting failure rows", "timeout": 30 }
+```
+
+| Argument | Required | Type | Description |
+| --- | --- | --- | --- |
+| `code` | yes | string | Python to run. Statements print nothing implicitly: use `print()` to show something, `ret({...})` to return data. |
+| `description` | yes | string | Short summary of what the cell does. |
+| `timeout` | no | number | Per-cell budget in seconds (default 30). Overrunning kills the cell **and its namespace**. |
+
+Names bound in one call -- variables, imports, functions, objects -- are still
+bound in the next, so a 5 MB list can stay in the kernel while only the slice the
+model decided matters comes back. Inside a cell:
+
+- `ret(value)` returns JSON-compatible data next to the captured output, so a
+  result does not have to be rendered into prose and re-parsed.
+- `SHOW_VARS()` lists bound names with types and sizes, never their values.
+- `llm_query(prompt, model=None)` and `llm_query_batched(prompts, model=None)`
+  call the session's current model from inside the cell; a failed batch entry
+  comes back as `None`. Sub-calls are given no tools, so a cell cannot start an
+  agent, and each cell has a sub-call budget that a runaway loop cannot exceed.
+
+The kernel is a separate Python process with no provider credentials in its
+environment and byte-bounded output. That boundary keeps model-written code from
+reaching harness objects or secrets; it is not a defence against hostile code.
+Set `"codeMode": false` in `~/.tau/settings.json` to start every session without
+this tool. A host that supplies its own `tools` list never receives it
+automatically, and `allowed_tool_names` can drop it like any other tool.
+
 ## Choosing the right tool
 
 - **`read`** — inspect files (instead of `cat`/`sed`).
 - **`write`** — new files or complete rewrites.
 - **`edit`** — precise changes to an existing file.
 - **`bash`** — tests, linters, searches, project inspection.
+- **`python_repl`** — data-shaped work: parsing, slicing, counting, comparing, or
+  one question fanned out over many chunks. Use `bash` to run project commands,
+  not to compute.

@@ -119,6 +119,7 @@ class _CellBuffer:
         "frame",
         "max_bytes",
         "state_lost",
+        "cancelled",
         "texts",
         "sizes",
         "omitted",
@@ -130,6 +131,7 @@ class _CellBuffer:
         self.frame: dict[str, Any] | None = None
         self.max_bytes = max_bytes
         self.state_lost = False
+        self.cancelled = False
         self.texts: dict[str, list[str]] = {"stdout": [], "stderr": []}
         self.sizes: dict[str, int] = {"stdout": 0, "stderr": 0}
         self.omitted: dict[str, int] = {"stdout": 0, "stderr": 0}
@@ -151,12 +153,15 @@ class _CellBuffer:
         self.frame = dict(frame)
         if frame.get("state_lost"):
             self.state_lost = True
+        if frame.get("cancelled"):
+            self.cancelled = True
 
     def result(
         self,
         *,
         timed_out: bool = False,
         state_lost: bool = False,
+        cancelled: bool = False,
         error: str | None = None,
     ) -> CellResult:
         """Build the :class:`CellResult` for this cell."""
@@ -175,6 +180,7 @@ class _CellBuffer:
             returned=bool(frame.get("returned", False)),
             ret_error=_optional_str(frame.get("ret_error")),
             timed_out=timed_out,
+            cancelled=cancelled or self.cancelled,
             state_lost=state_lost or self.state_lost,
         )
 
@@ -329,6 +335,12 @@ class ProcessKernel:
             reason = self._crash_note("the kernel did not report ready")
             await self._stop(f"{reason} (startup exceeded {self._startup_timeout:.1f}s)")
             raise KernelUnavailableError(reason) from exc
+        if self._writer is None or not self._alive:
+            # A cell cancelled while the kernel was booting wakes this waiter without
+            # handing it a channel; failing here keeps the caller from writing to None.
+            reason = self._dead_reason or "the kernel stopped before it finished starting"
+            await self._stop(reason)
+            raise KernelUnavailableError(reason)
         if self._ever_started:
             self._restarts += 1
         self._ever_started = True
@@ -366,20 +378,30 @@ class ProcessKernel:
     async def execute(self, code: str, *, timeout: float | None = None) -> CellResult:
         """Run one cell in the persistent namespace."""
         async with self._cell_lock:
-            await self._ensure_running()
-            assert self._writer is not None
             cell_id = uuid.uuid4().hex[:12]
             buffer = _CellBuffer(cell_id, self._max_cell_output_bytes)
-            self._pending[cell_id] = buffer
             limit = self._cell_timeout if timeout is None else float(timeout)
+            # Registered before the process is checked: a stop that lands while this
+            # cell is still starting has to answer *this* cell, not a future one.
+            self._pending[cell_id] = buffer
             timed_out = False
             try:
-                await write_frame(self._writer, {"op": OP_EXEC, "cell_id": cell_id, "code": code})
                 try:
-                    await asyncio.wait_for(buffer.done.wait(), limit)
-                except TimeoutError:
-                    timed_out = True
-                    await self._stop(f"the cell ran past its {limit:.1f}s budget")
+                    await self._ensure_running()
+                    writer = self._writer
+                    if writer is None:  # pragma: no cover - _ensure_running guards this
+                        raise KernelUnavailableError(
+                            self._dead_reason or "the kernel channel is not open"
+                        )
+                    await write_frame(writer, {"op": OP_EXEC, "cell_id": cell_id, "code": code})
+                    try:
+                        await asyncio.wait_for(buffer.done.wait(), limit)
+                    except TimeoutError:
+                        timed_out = True
+                        await self._stop(f"the cell ran past its {limit:.1f}s budget")
+                except (KernelError, FrameError, OSError):
+                    if buffer.frame is None:
+                        raise
             finally:
                 self._pending.pop(cell_id, None)
                 self._cells_run += 1
@@ -393,7 +415,7 @@ class ProcessKernel:
                         "that cell bound survives"
                     ),
                 )
-            return buffer.result(state_lost=buffer.state_lost)
+            return buffer.result(state_lost=buffer.state_lost, cancelled=buffer.cancelled)
 
     async def state(self) -> KernelState:
         """Inventory bound names and sizes, never their values."""
@@ -610,13 +632,27 @@ class ProcessKernel:
         clipped, _ = bounded_text(stderr, DEFAULT_RAW_TAIL_BYTES)
         return f"{base}: {clipped}"
 
-    async def _stop(self, reason: str) -> None:
+    async def abort_cell(self, reason: str) -> None:
+        """Stop the cell that is running right now.
+
+        Option A has no interrupt, so the process dies with the cell and
+        ``state_lost`` is reported; the in-flight ``execute`` returns a cancelled
+        result rather than raising.
+        """
+        await self._stop(reason, cancelled=True)
+
+    async def _stop(self, reason: str, *, cancelled: bool = False) -> None:
         """Mark the kernel dead, unblock waiters, and end the process."""
         self._alive = False
         self._dead_reason = reason
         for buffer in list(self._pending.values()):
-            buffer.finish({"ok": False, "error": reason, "state_lost": True})
+            buffer.finish(
+                {"ok": False, "error": reason, "state_lost": True, "cancelled": cancelled}
+            )
             buffer.done.set()
+        # A kernel killed mid-startup must not leave its starter waiting for a
+        # handshake that will never arrive.
+        self._ready.set()
         for task in self._drains:
             task.cancel()
         self._drains = []

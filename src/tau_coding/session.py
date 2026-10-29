@@ -47,6 +47,7 @@ from tau_agent.types import JSONValue
 from tau_ai.model_catalog import ModelCatalogProvider, RuntimeModel, RuntimeModelCatalog
 from tau_ai.model_limits import ModelLimitsProvider, RuntimeModelLimits
 from tau_coding.branch_summary import summarize_branch_messages_with_model
+from tau_coding.code_mode import CodeMode
 from tau_coding.codex_model_store import (
     cached_codex_model_catalog,
     save_codex_model_catalog,
@@ -86,6 +87,7 @@ from tau_coding.extensions.api import BeforeCompactEvent, CompactionContextEntry
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
+from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.models_dev_store import ModelsDevRefreshResult, refresh_models_dev_catalog
 from tau_coding.oauth import account_id_from_access_token
 from tau_coding.paths import TauPaths
@@ -209,6 +211,24 @@ async def _finish_adopted_runtime_close(runtime: ExtensionRuntime) -> None:
     await _await_cleanup_completion(task)
     # Publication is already committed. Cleanup cancellation/failure must not
     # masquerade as rollback while the task's outcome still gets retrieved.
+    with suppress(BaseException):
+        task.result()
+
+
+async def _finish_adopted_code_mode_close(code_mode: CodeMode | None) -> None:
+    """Close the kernel a replaced session was holding, without failing adoption.
+
+    A code-mode kernel holds one conversation's working memory. Carrying it into
+    a new, resumed, or branched conversation would leak that memory, so the
+    outgoing kernel is closed once the replacement is committed.
+    """
+    if code_mode is None:
+        return
+    task = asyncio.create_task(
+        code_mode.dispose(),
+        name="tau-adopted-code-mode-close",
+    )
+    await _await_cleanup_completion(task)
     with suppress(BaseException):
         task.result()
 
@@ -383,6 +403,17 @@ class CodingSessionConfig:
     """
     index_on_first_persist: bool = False
     shell_command_prefix: str | None = None
+    code_mode_enabled: bool = True
+    """Whether the default tool set includes the code-mode ``python_repl`` tool.
+
+    Code mode runs model-written Python in a persistent kernel process; see
+    :mod:`tau_coding.code_mode`. It ships as part of the *default* tool set, so a
+    host that passes an explicit ``tools`` list owns that set and receives no
+    ``python_repl`` unless it builds one. ``allowed_tool_names`` caps the tool by
+    name like any other, and an extension may replace it by registering a tool of
+    the same name. ``False`` skips the kernel entirely, which is what a restricted
+    subagent type should use when it must not execute arbitrary Python.
+    """
     skills_enabled: bool = True
     """Whether skill discovery is enabled for this session.
 
@@ -497,6 +528,7 @@ class CodingSession:
         )
         self._owned_providers: list[ClosableModelProvider] = []
         self._close_task: asyncio.Task[None] | None = None
+        self._code_mode: CodeMode | None = None
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
         self._credential_store = FileCredentialStore(
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
@@ -724,6 +756,13 @@ class CodingSession:
                 image_support=image_support,
             )
         )
+        code_mode = (
+            None
+            if config.tools is not None or not config.code_mode_enabled
+            else CodeMode(cwd=config.cwd)
+        )
+        if code_mode is not None:
+            base_tools = [*base_tools, code_mode.tool()]
         tools = _filter_tools(
             extension_runtime.compose_tools(base_tools), config.allowed_tool_names
         )
@@ -765,6 +804,17 @@ class CodingSession:
             ),
             messages=state.messages,
         )
+        if code_mode is not None:
+            # Sub-calls resolve the provider and model when a cell asks for one,
+            # through the harness config object the session mutates in place on
+            # ``/model`` and provider selection. A kernel created before a model
+            # change therefore asks the *current* model, not the startup one.
+            code_mode.bind_subcall(
+                SubcallBridge(
+                    provider=lambda: harness.config.provider,
+                    model=lambda: harness.config.model,
+                )
+            )
         if previous_runtime is not None:
             extension_runtime.set_ui_bridge(previous_runtime.ui)
         session = cls(
@@ -787,6 +837,7 @@ class CodingSession:
             image_support=image_support,
             project_trust_resolution=trust_resolution,
         )
+        session._code_mode = code_mode
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -980,6 +1031,16 @@ class CodingSession:
     def tools(self) -> tuple[AgentTool, ...]:
         """Return the tools available to the agent."""
         return tuple(self._harness.config.tools)
+
+    @property
+    def code_mode(self) -> CodeMode | None:
+        """Return this session's code-mode handle, or ``None`` when code mode is off.
+
+        A live handle does not imply a running kernel -- the process starts on the
+        first cell. This exists so the TUI, tests, and extensions can tell whether
+        a namespace can exist for this session without touching session internals.
+        """
+        return self._code_mode
 
     @property
     def extension_tool_sources(self) -> dict[str, str]:
@@ -2418,6 +2479,26 @@ class CodingSession:
             if isinstance(provider, ModelCatalogProvider):
                 self._model_catalog_discovery_errors[self.provider_name] = error
 
+    def _code_mode_tool(self) -> AgentTool | None:
+        """Return this session's code-mode tool, creating its holder on demand.
+
+        ``/reload`` rebuilds tools but keeps the session's code-mode object, so a
+        namespace the model has been building survives a resource reload. Kernel
+        creation stays lazy: a session that never calls the tool never spawns a
+        process.
+        """
+        if self._config.tools is not None or not self._config.code_mode_enabled:
+            return None
+        if self._code_mode is None:
+            self._code_mode = CodeMode(cwd=self._config.cwd)
+            self._code_mode.bind_subcall(
+                SubcallBridge(
+                    provider=lambda: self._harness.config.provider,
+                    model=lambda: self._harness.config.model,
+                )
+            )
+        return self._code_mode.tool()
+
     async def reload(self) -> CodingReloadSummary:
         """Stage and atomically publish a complete replacement snapshot."""
         self._require_idle("reload")
@@ -2528,6 +2609,9 @@ class CodingSession:
                 image_support=self._image_support,
             )
         )
+        code_mode_tool = self._code_mode_tool()
+        if code_mode_tool is not None:
+            base_tools = [*base_tools, code_mode_tool]
         staged_tools = _filter_tools(
             staged_runtime.compose_tools(base_tools), self._config.allowed_tool_names
         )
@@ -2852,6 +2936,7 @@ class CodingSession:
                 auto_compact_enabled=self._auto_compact_enabled,
                 thinking_level=self._thinking_level,
                 shell_command_prefix=self._config.shell_command_prefix,
+                code_mode_enabled=self._config.code_mode_enabled,
                 skills_enabled=self._config.skills_enabled,
                 allowed_tool_names=self._config.allowed_tool_names,
                 extension_paths=self._config.extension_paths,
@@ -3037,6 +3122,7 @@ class CodingSession:
         replacement instance.
         """
         old_runtime = self._extension_runtime
+        old_code_mode = self._code_mode
         try:
             if (
                 replacement.project_trust_resolution is not None
@@ -3102,6 +3188,7 @@ class CodingSession:
         self._pending_message_writes = replacement._pending_message_writes
         self._extension_runtime = replacement._extension_runtime
         self._provider_registry = replacement._provider_registry
+        self._code_mode = replacement._code_mode
         self._credential_store = replacement._credential_store
         self._diagnostic_logger = replacement._diagnostic_logger
         self._runtime_model_limits = replacement._runtime_model_limits
@@ -3120,6 +3207,7 @@ class CodingSession:
         # shielded owner and contain cancellation rather than reporting that
         # the requested destination failed to replace the source session.
         await _finish_adopted_runtime_close(old_runtime)
+        await _finish_adopted_code_mode_close(old_code_mode)
 
     async def compact_detailed(self, instructions: str | None = None) -> ManualCompactionResult:
         """Compact older context while preserving a real recent-entry boundary."""
@@ -3212,6 +3300,15 @@ class CodingSession:
         # still owns the async drain/containment step and must never skip it.
         try:
             await self._extension_runtime.aclose()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+
+        # A kernel is a child process that may be sitting inside a sub-call. Close
+        # it before providers so nothing can start a request behind the teardown.
+        try:
+            if self._code_mode is not None:
+                await self._code_mode.dispose()
         except BaseException as exc:
             if error is None:
                 error = exc

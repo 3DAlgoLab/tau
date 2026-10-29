@@ -71,6 +71,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [Deterministic Compaction QA Probes](./compaction-qa-probes.md)
 - [Deterministic Compaction As An Extension](./compaction-engine-extension.md)
 - [Code-Mode Kernel (Phase 2a)](./code-mode-kernel.md)
+- [Code Mode As A Session Tool (Phase 2b)](./code-mode-tool-and-subcalls.md)
 
 Phase 21 extensions are implemented; see the phase note and the user guide at
 `website/content/guides/extensions.md`.

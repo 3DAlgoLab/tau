@@ -1,0 +1,406 @@
+"""Code mode: one persistent Python kernel per session, exposed as ``python_repl``.
+
+Code mode is the mechanism RLM assumes upstream -- context held in a variable the
+model slices, and model calls written as functions inside code -- and it is
+useful on its own for anything shaped like data: parsing a log, diffing two
+structures, fanning one question over forty chunks.
+
+Why it is a tool with a kernel behind it rather than a shell: ``bash`` gives the
+model a text pipe, so every intermediate has to be printed to be seen. A Python
+namespace lets the model hold a 5 MB list and return only the slice it decided
+mattered. The economic argument for recursive work depends on that: the parent
+partitions in code and only the partition's answer crosses into a context.
+
+This module owns the seam between the harness and
+:mod:`tau_coding.kernel`: it creates one kernel per session, hands the kernel a
+sub-call bridge bound to the session's provider and *current* model, converts a
+:class:`~tau_coding.kernel.protocol.CellResult` into an
+:class:`~tau_agent.tools.AgentToolResult`, and closes the kernel when the session
+closes. Policy lives here; the kernel package stays mechanism.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+from tau_agent.messages import TextContent
+from tau_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, ToolUpdateCallback
+from tau_agent.types import JSONValue
+from tau_coding.kernel.frames import FrameError
+from tau_coding.kernel.process import ProcessKernel
+from tau_coding.kernel.protocol import (
+    CellResult,
+    Kernel,
+    KernelError,
+    KernelLimits,
+)
+from tau_coding.kernel.subcall import (
+    DEFAULT_MAX_SUBCALLS_PER_CELL,
+    SubcallBridge,
+    SubcallTotals,
+)
+from tau_coding.tools import ToolInputError, format_size, truncate_head
+
+__all__ = [
+    "DEFAULT_CELL_TIMEOUT_SECONDS",
+    "PYTHON_REPL_TOOL_NAME",
+    "CodeMode",
+    "MAX_CODE_BYTES",
+]
+
+PYTHON_REPL_TOOL_NAME = "python_repl"
+
+DEFAULT_CELL_TIMEOUT_SECONDS = 30.0
+"""Per-cell budget. Overrun kills the cell *and its namespace*."""
+
+MAX_CODE_BYTES = 64 * 1024
+MAX_OUTPUT_LINES = 400
+MAX_OUTPUT_BYTES = 16 * 1024
+"""Tool-level ceiling on what a cell's text output contributes to context.
+
+The kernel caps what it captures at a larger size; this caps what the harness
+hands to the model. Both counts are reported, so a shrunken answer says how much
+of itself it lost at each layer.
+"""
+
+_CANCEL_POLL_SECONDS = 0.05
+
+_CODE_DESCRIPTION = (
+    "Python to execute in the persistent kernel. Statements run as written: "
+    "nothing prints implicitly, so use print() to show something and ret({...}) "
+    "to return a result as data."
+)
+
+_REPL_DESCRIPTION = (
+    "Execute Python in a persistent kernel tied to this session. Names bound in "
+    "one call -- variables, imports, functions, objects -- are still there in the "
+    "next, so large data can stay in the kernel while only the slice that matters "
+    "is printed. Returns captured stdout and stderr, plus any value passed to "
+    "ret(...), which arrives as JSON rather than prose. SHOW_VARS() lists bound "
+    "names and their sizes without values. llm_query(prompt, model=None) and "
+    "llm_query_batched(prompts, model=None) call the session's model from inside "
+    "the cell; a batched failure comes back as None. A cell that exceeds its "
+    "timeout is killed, which also discards the namespace."
+)
+
+_REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
+
+_REPL_GUIDELINES: tuple[str, ...] = (
+    "Use python_repl when the work is shaped like data: parsing, slicing, counting, "
+    "comparing, or asking the same question over many chunks. Use bash for build and "
+    "test commands, and write/edit for file changes.",
+    "The namespace persists between calls: bind names once, then use them in later "
+    "calls instead of re-reading or re-printing them.",
+    "Do not print large objects to inspect them. Slice, count, and sample first, and "
+    "end the cell with ret({...}) so the result comes back as data.",
+    "Keep material in kernel variables and use llm_query/llm_query_batched to ask "
+    "about it in chunks; bring back answers, not the corpus.",
+    "A cell that overruns its timeout is killed together with its namespace, so split "
+    "long work across cells rather than into one long one.",
+)
+
+_REPL_INPUT_SCHEMA: dict[str, JSONValue] = {
+    "type": "object",
+    "properties": {
+        "code": {"type": "string", "description": _CODE_DESCRIPTION},
+        "description": {
+            "type": "string",
+            "description": (
+                "Brief present-participle summary of what the cell does, such as "
+                "'Partitioning the changelog by file'"
+            ),
+        },
+        "timeout": {
+            "type": "number",
+            "description": (
+                f"Per-cell budget in seconds (default {DEFAULT_CELL_TIMEOUT_SECONDS:g}). "
+                "Exceeding it kills the cell and clears the namespace."
+            ),
+        },
+    },
+    "required": ["code", "description"],
+}
+
+
+class CodeMode:
+    """One kernel per session, plus the ``python_repl`` tool that drives it.
+
+    The kernel object is created lazily, so a session that never calls the tool
+    never pays for a process. ``/reload`` re-builds tools but keeps this object --
+    and therefore the namespace -- because the namespace is the model's working
+    memory, not a resource file.
+    """
+
+    def __init__(
+        self,
+        *,
+        cwd: Path,
+        subcall: SubcallBridge | None = None,
+        limits: KernelLimits | None = None,
+        cell_timeout_seconds: float = DEFAULT_CELL_TIMEOUT_SECONDS,
+        max_concurrent_subcalls: int = 4,
+        max_calls_per_cell: int | None = DEFAULT_MAX_SUBCALLS_PER_CELL,
+        kernel_factory: Callable[[], Kernel] | None = None,
+    ) -> None:
+        self._cwd = cwd
+        self._subcall = subcall
+        self._limits = limits
+        self._cell_timeout = cell_timeout_seconds
+        self._max_concurrent_subcalls = max(1, max_concurrent_subcalls)
+        self._max_calls_per_cell = max_calls_per_cell
+        self._kernel_factory = kernel_factory or self._default_kernel
+        self._kernel: Kernel | None = None
+        self._tool: AgentTool | None = None
+        self._disposed = False
+
+    # -- wiring -------------------------------------------------------------
+
+    def bind_subcall(self, bridge: SubcallBridge) -> None:
+        """Attach the host-side answerer for kernel sub-calls.
+
+        A session builds this after its harness exists, because a sub-call resolves
+        the live provider and model rather than the startup ones. Binding happens
+        before the first cell: the kernel captures the bridge when it starts, and a
+        kernel created without one cannot gain ``llm_query`` afterwards.
+        """
+        if self._kernel is not None:
+            raise RuntimeError("cannot bind sub-calls after this kernel has run a cell")
+        if self._max_calls_per_cell is not None:
+            bridge.max_calls_per_cell = self._max_calls_per_cell
+        self._subcall = bridge
+
+    def tool(self) -> AgentTool:
+        """Return the session's ``python_repl`` tool."""
+        if self._tool is None:
+            self._tool = AgentTool(
+                name=PYTHON_REPL_TOOL_NAME,
+                label="python",
+                description=_REPL_DESCRIPTION,
+                parameters=_REPL_INPUT_SCHEMA,
+                execute_fn=self._execute,
+                prompt_snippet=_REPL_SNIPPET,
+                prompt_guidelines=_REPL_GUIDELINES,
+                # One namespace, so two cells cannot interleave inside it.
+                execution_mode="sequential",
+                render_call=_render_call,
+            )
+        return self._tool
+
+    async def dispose(self) -> None:
+        """Close the kernel if one was ever started. Closing is permanent."""
+        self._disposed = True
+        kernel = self._kernel
+        self._kernel = None
+        if kernel is not None:
+            await kernel.close()
+
+    @property
+    def started(self) -> bool:
+        """Whether this session has run a cell yet."""
+        return self._kernel is not None
+
+    @property
+    def subcall_bridge(self) -> SubcallBridge | None:
+        """The host-side answerer for kernel sub-calls, if code mode has one."""
+        return self._subcall
+
+    def _default_kernel(self) -> Kernel:
+        return ProcessKernel(
+            cwd=self._cwd,
+            subcall=self._subcall,
+            max_concurrent_subcalls=self._max_concurrent_subcalls,
+            cell_timeout_seconds=self._cell_timeout,
+            limits=self._limits,
+        )
+
+    def _kernel_or_new(self) -> Kernel:
+        if self._kernel is None:
+            self._kernel = self._kernel_factory()
+        return self._kernel
+
+    # -- execution ----------------------------------------------------------
+
+    async def _execute(
+        self,
+        tool_call_id: str,
+        arguments: Mapping[str, JSONValue],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id, on_update
+        code = _code_arg(arguments)
+        timeout = _timeout_arg(arguments, default=self._cell_timeout)
+        if self._disposed:
+            return _failure_result(
+                "code mode is closed for this session; start a new session to run Python again"
+            )
+        if signal is not None and signal.is_cancelled():
+            raise ToolInputError("Cell cancelled")
+
+        kernel = self._kernel_or_new()
+        bridge = self._subcall
+        if bridge is not None:
+            bridge.begin_cell(signal)
+        watch: asyncio.Task[None] | None = None
+        try:
+            if signal is not None:
+                watch = asyncio.create_task(self._watch_cancellation(kernel, signal))
+            result = await kernel.execute(code, timeout=timeout)
+        except (KernelError, FrameError, OSError) as exc:
+            return _failure_result(f"the code-mode kernel could not run this cell: {exc}")
+        finally:
+            if watch is not None:
+                watch.cancel()
+            totals = bridge.take_totals() if bridge is not None else None
+            if bridge is not None:
+                bridge.end_cell()
+
+        return _describe(result, totals, kernel, timeout=timeout)
+
+    async def _watch_cancellation(self, kernel: Kernel, signal: ToolCancellationToken) -> None:
+        """Abort the cell when the harness cancels it.
+
+        A Python cell cannot be interrupted from outside, so cancellation is a
+        kill and the namespace goes with it -- which is why the result says so.
+        """
+        while not signal.is_cancelled():
+            await asyncio.sleep(_CANCEL_POLL_SECONDS)
+        await kernel.abort_cell("the cell was cancelled")
+
+
+# -- reporting --------------------------------------------------------------
+
+
+def _render_call(arguments: Mapping[str, JSONValue]) -> str | None:
+    code = arguments.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    lines = [line for line in code.strip().splitlines() if line.strip()]
+    first = lines[0].strip()
+    if len(lines) > 1:
+        return f"{first}  (+{len(lines) - 1} more line{'s' if len(lines) > 2 else ''})"
+    return first
+
+
+def _describe(
+    result: CellResult,
+    totals: SubcallTotals | None,
+    kernel: Kernel,
+    *,
+    timeout: float,
+) -> AgentToolResult:
+    blocks: list[str] = []
+    output = result.stdout
+    if result.stderr:
+        output = f"{output}\n{result.stderr}" if output else result.stderr
+    if output.strip():
+        truncation = truncate_head(
+            output.strip(), max_lines=MAX_OUTPUT_LINES, max_bytes=MAX_OUTPUT_BYTES
+        )
+        blocks.append(truncation.content)
+        if truncation.truncated:
+            note = f"[showing first {truncation.output_lines} of {truncation.total_lines} lines"
+            if truncation.truncated_by == "bytes":
+                note += f" ({format_size(MAX_OUTPUT_BYTES)} limit)"
+            note += "]"
+            blocks.append(note)
+    elif result.ok:
+        blocks.append("(no output)")
+
+    if result.returned:
+        if result.ret_error:
+            blocks.append(f"[ret rejected: {result.ret_error}]")
+        else:
+            blocks.append(f"[ret] {_as_json(result.ret)}")
+
+    if totals is not None and totals.calls:
+        parts = [f"{totals.calls} sub-call{'' if totals.calls == 1 else 's'}"]
+        if totals.models:
+            parts.append(f"via {', '.join(totals.models)}")
+        parts.append(f"{totals.requested_tokens} in / {totals.output_tokens} out tokens")
+        if totals.cost:
+            parts.append(f"~${totals.cost:.4f}")
+        if totals.failures:
+            parts.append(f"{totals.failures} failed")
+        blocks.append(f"[{' '.join(parts)}]")
+
+    if not result.ok and result.error:
+        blocks.append(f"[error] {result.error.strip()}")
+    if result.timed_out:
+        blocks.append(
+            f"[cell killed after exceeding its {timeout:g}s budget; the namespace is "
+            "gone; split the work into smaller cells]"
+        )
+    elif result.cancelled:
+        blocks.append("[cell cancelled]")
+    elif result.state_lost:
+        blocks.append("[the kernel restarted: names bound by this cell did not survive]")
+
+    dropped = result.omitted_bytes
+    if dropped:
+        blocks.append(f"[{format_size(dropped)} of this cell's output was capped and not returned]")
+
+    details: dict[str, JSONValue] = {
+        "ok": result.ok,
+        "duration_ms": result.duration_ms,
+        "timed_out": result.timed_out,
+        "cancelled": result.cancelled,
+        "state_lost": result.state_lost,
+        "returned": result.returned,
+        "ret": result.ret,
+        "ret_error": result.ret_error,
+        "error": result.error,
+        "output_omitted_bytes": result.omitted_bytes,
+        "kernel": {
+            "alive": kernel.alive,
+            "cells_run": kernel.cells_run,
+            "subcalls_used": kernel.subcalls_used,
+            "restarts": kernel.restarts,
+        },
+    }
+    if totals is not None:
+        details["subcalls"] = totals.to_json()
+
+    return AgentToolResult(content=[TextContent(text="\n\n".join(blocks))], details=details)
+
+
+def _failure_result(message: str) -> AgentToolResult:
+    return AgentToolResult(
+        content=[TextContent(text=f"[error] {message}")],
+        details={"ok": False, "error": message},
+    )
+
+
+def _as_json(value: JSONValue) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - frames already encode cleanly
+        return str(value)
+
+
+def _code_arg(arguments: Mapping[str, JSONValue]) -> str:
+    raw = arguments.get("code")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolInputError("code must be a non-empty string")
+    if len(raw.encode("utf-8")) > MAX_CODE_BYTES:
+        raise ToolInputError(
+            f"code is {format_size(len(raw.encode('utf-8')))}; the limit is "
+            f"{format_size(MAX_CODE_BYTES)}. Split the work across cells -- the "
+            "namespace persists between them."
+        )
+    return raw
+
+
+def _timeout_arg(arguments: Mapping[str, JSONValue], *, default: float) -> float:
+    raw = arguments.get("timeout")
+    if raw is None:
+        return default
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise ToolInputError("timeout must be a number")
+    value = float(raw)
+    if value <= 0:
+        raise ToolInputError("timeout must be greater than 0")
+    return value

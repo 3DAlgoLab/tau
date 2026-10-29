@@ -142,6 +142,7 @@ class CellResult:
     returned: bool = False
     ret_error: str | None = None
     timed_out: bool = False
+    cancelled: bool = False
     state_lost: bool = False
 
     @property
@@ -193,12 +194,32 @@ class Kernel(Protocol):
         """Sub-completions served for this kernel so far."""
         ...
 
+    @property
+    def cells_run(self) -> int:
+        """Cells executed by this kernel object, including killed ones."""
+        ...
+
+    @property
+    def restarts(self) -> int:
+        """Times the kernel was restarted after being killed."""
+        ...
+
     async def start(self) -> None:
         """Start the kernel, or restart it after it was killed."""
         ...
 
     async def execute(self, code: str, *, timeout: float | None = None) -> CellResult:
         """Run one cell in the persistent namespace."""
+        ...
+
+    async def abort_cell(self, reason: str) -> None:
+        """Stop the cell that is running right now.
+
+        The in-flight :meth:`execute` returns with ``cancelled`` set. Whether the
+        namespace survives is implementation-specific and reported through
+        ``state_lost``: option A has no interrupt, so it kills the process, while
+        an ``ipykernel`` kernel interrupts the cell and keeps the namespace.
+        """
         ...
 
     async def state(self) -> KernelState:
