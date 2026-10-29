@@ -9077,6 +9077,7 @@ async def run_tui_app(
                 shell_command_prefix=shell_settings.shell_command_prefix,
                 code_mode_enabled=shell_settings.code_mode,
                 code_mode_recursion_enabled=shell_settings.code_mode_recursion,
+                code_mode_python=shell_settings.code_mode_python,
                 extension_paths=extension_paths,
                 extensions_enabled=extensions_enabled,
                 project_extensions_enabled=project_extensions_enabled,

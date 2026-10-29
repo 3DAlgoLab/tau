@@ -53,6 +53,16 @@ class ShellSettings:
     gains ``python_repl`` automatically.
     """
 
+    code_mode_python: str | None = None
+    """Interpreter the code-mode kernel should run on.
+
+    ``None`` keeps Tau's own interpreter, which after a ``uv tool install`` is a
+    sealed environment without pip and without the packages a data task wants.
+    Naming an interpreter here is the alternative to installing into the kernel:
+    the kernel then starts on an interpreter that already has what the model
+    needs, and the package environment follows it.
+    """
+
     code_mode_recursion: bool = False
     """Whether ``python_repl`` also binds ``rlm_query`` / ``rlm_query_batched``.
 
@@ -74,6 +84,8 @@ class ShellSettings:
             result["shellCommandPrefix"] = self.shell_command_prefix
         if not self.code_mode:
             result["codeMode"] = False
+        if self.code_mode_python is not None:
+            result["codeModePython"] = self.code_mode_python
         if self.code_mode_recursion:
             result["codeModeRecursion"] = True
         if self.last_model is not None:
@@ -110,6 +122,8 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
         raise ShellConfigError("Use only one of codeMode or code_mode")
     if "codeModeRecursion" in data and "code_mode_recursion" in data:
         raise ShellConfigError("Use only one of codeModeRecursion or code_mode_recursion")
+    if "codeModePython" in data and "code_mode_python" in data:
+        raise ShellConfigError("Use only one of codeModePython or code_mode_python")
     if "lastModel" in data and "last_model" in data:
         raise ShellConfigError("Use only one of lastModel or last_model")
 
@@ -131,6 +145,16 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
     if not isinstance(raw_recursion, bool):
         raise ShellConfigError("codeModeRecursion must be a boolean")
 
+    # An interpreter is a name or a path, so only an empty value is refused: a
+    # path that does not resolve is reported when the kernel starts, where the
+    # failure can be explained, rather than at settings load.
+    raw_python = data.get("codeModePython", data.get("code_mode_python"))
+    if raw_python is not None and not isinstance(raw_python, str):
+        raise ShellConfigError("codeModePython must be a string naming an interpreter, or null")
+    code_mode_python = raw_python.strip() if isinstance(raw_python, str) else None
+    if code_mode_python == "":
+        code_mode_python = None
+
     last_model = _last_model_from_json(data.get("lastModel", data.get("last_model")))
 
     raw_prefix = data.get("shellCommandPrefix", data.get("shell_command_prefix"))
@@ -138,6 +162,7 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
         return ShellSettings(
             default_project_trust=raw_default,
             code_mode=raw_code_mode,
+            code_mode_python=code_mode_python,
             code_mode_recursion=raw_recursion,
             last_model=last_model,
         )
@@ -148,6 +173,7 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
         shell_command_prefix=prefix or None,
         default_project_trust=raw_default,
         code_mode=raw_code_mode,
+        code_mode_python=code_mode_python,
         code_mode_recursion=raw_recursion,
         last_model=last_model,
     )

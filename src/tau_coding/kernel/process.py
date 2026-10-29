@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from tau_coding.kernel.frames import FrameError, read_frame, write_frame
+from tau_coding.kernel.packages import InterpreterInfo, PackageInstallError, probe_interpreter
 from tau_coding.kernel.protocol import (
     ENV_HOST,
     ENV_PORT,
@@ -256,6 +257,7 @@ class ProcessKernel:
         max_cell_output_bytes: int = DEFAULT_CELL_OUTPUT_BYTES,
         python_executable: str | None = None,
         extra_env: Mapping[str, str] | None = None,
+        package_site_base: Path | None = None,
     ) -> None:
         self._cwd = cwd
         self._subcall = subcall
@@ -269,6 +271,9 @@ class ProcessKernel:
         self._max_cell_output_bytes = max_cell_output_bytes
         self._executable = python_executable or sys.executable
         self._extra_env = dict(extra_env or {})
+        self._package_site_base = package_site_base
+        self._interpreter: InterpreterInfo | None = None
+        self._package_site_dirs: tuple[Path, ...] = ()
 
         self._host = HOST_DEFAULT
         self._token = secrets.token_hex(16)
@@ -359,6 +364,21 @@ class ProcessKernel:
         return _optional_str(self._ready_info.get("python"))
 
     @property
+    def python_executable(self) -> str:
+        """The interpreter this kernel runs model code on."""
+        return self._executable
+
+    @property
+    def package_site_dirs(self) -> tuple[Path, ...]:
+        """Directories installed packages land in, empty if none are configured.
+
+        Known before the child starts, because the directory is part of the
+        child's ``PYTHONPATH``: a kernel and an installer have to agree on the
+        path without either having to ask the other first.
+        """
+        return self._package_site_dirs
+
+    @property
     def dead_reason(self) -> str | None:
         """Why the kernel last stopped, if it has."""
         return self._dead_reason
@@ -392,6 +412,7 @@ class ProcessKernel:
         self._ready_info = {}
         self._dead_reason = None
         self._closing = False
+        await self._prepare_package_site()
         env = self._child_env()
         try:
             self._proc = await asyncio.create_subprocess_exec(
@@ -864,12 +885,42 @@ class ProcessKernel:
 
     # -- process plumbing ---------------------------------------------------
 
+    async def _prepare_package_site(self) -> None:
+        """Resolve and create the version-keyed package directory for this kernel.
+
+        The host needs the interpreter's identity *before* spawning the child,
+        since the site directory travels in its environment. Asking the
+        interpreter rather than assuming the host's own version is what keeps a
+        configured ``codeModePython`` from being installed into the wrong ABI.
+        """
+        if self._package_site_base is None or self._package_site_dirs:
+            return
+        try:
+            info = await probe_interpreter(self._executable)
+        except PackageInstallError as exc:
+            raise KernelUnavailableError(str(exc)) from exc
+        site = info.site_dir(self._package_site_base)
+        try:
+            site.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise KernelUnavailableError(
+                f"cannot create the kernel package directory {site}: {exc}"
+            ) from exc
+        self._interpreter = info
+        self._package_site_dirs = (site,)
+
     def _child_env(self) -> dict[str, str]:
         """Build the child environment: inherited, minus anything secret."""
         env = {key: value for key, value in os.environ.items() if not looks_secret(key)}
         source_root = str(Path(__file__).resolve().parents[2])
+        # The kernel package dir goes second: installed packages must shadow
+        # nothing the host itself needs, and must still be importable when the
+        # inherited path says otherwise.
+        search = [source_root, *(str(site) for site in self._package_site_dirs)]
         existing = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{source_root}{os.pathsep}{existing}" if existing else source_root
+        if existing:
+            search.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(search)
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env[ENV_HOST] = self._host

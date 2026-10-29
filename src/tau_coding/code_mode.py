@@ -32,6 +32,12 @@ from tau_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, T
 from tau_agent.types import JSONValue
 from tau_coding.context_entries import ContextEntries
 from tau_coding.kernel.frames import FrameError
+from tau_coding.kernel.packages import (
+    InstallReport,
+    PackageInstaller,
+    PackageInstallError,
+    validate_specs,
+)
 from tau_coding.kernel.process import DEFAULT_MAX_CONCURRENT_RLMS, ProcessKernel
 from tau_coding.kernel.protocol import (
     CellResult,
@@ -102,7 +108,10 @@ _REPL_DESCRIPTION = (
     "never enter the prompt, and context_index()/context_open(refs) do the same "
     "for the session's own history. A cell that exceeds its timeout is killed, "
     "which also discards the namespace; the budget measures your code, not the model "
-    "calls made from inside a cell."
+    "calls made from inside a cell. The kernel's interpreter is not necessarily "
+    'the python3 on PATH: install(["numpy"]) adds packages to a persistent '
+    "environment built for the kernel's own interpreter, and sys.executable tells "
+    "you which interpreter that is."
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
@@ -137,6 +146,11 @@ _REPL_GUIDELINES: tuple[str, ...] = (
     "about it in chunks; bring back answers, not the corpus.",
     "A cell that overruns its timeout is killed together with its namespace, so split "
     "long work across cells rather than into one long one.",
+    "Do not assume a third-party package is importable: the kernel runs its own "
+    "interpreter, not the shell's python3. Ask for what you need with "
+    'install(["numpy"]) and import it in the same call -- that environment is '
+    "keyed to the kernel's interpreter and outlives the kernel process, so one "
+    "install serves every later cell.",
 )
 
 _REPL_INPUT_SCHEMA: dict[str, JSONValue] = {
@@ -155,6 +169,17 @@ _REPL_INPUT_SCHEMA: dict[str, JSONValue] = {
             "description": (
                 f"Per-cell budget in seconds (default {DEFAULT_CELL_TIMEOUT_SECONDS:g}). "
                 "Exceeding it kills the cell and clears the namespace."
+            ),
+        },
+        "install": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Packages to install into this kernel's persistent package "
+                'environment before the cell runs, such as ["numpy"] or '
+                '["scipy==1.15.0"]. The environment belongs to the kernel\'s own '
+                "interpreter and survives kernel restarts, so import the package "
+                "in the same call rather than in a later one."
             ),
         },
         "attach": {
@@ -194,6 +219,9 @@ class CodeMode:
         max_calls_per_cell: int | None = DEFAULT_MAX_SUBCALLS_PER_CELL,
         recursion_enabled: bool = False,
         kernel_factory: Callable[[], Kernel] | None = None,
+        python_executable: str | None = None,
+        package_site_base: Path | None = None,
+        installer_factory: Callable[[str, Path], PackageInstaller] | None = None,
     ) -> None:
         self._cwd = cwd
         self._subcall = subcall
@@ -209,6 +237,11 @@ class CodeMode:
         # the promise is made early and the runner arrives before the first cell.
         self._recursion_enabled = recursion_enabled
         self._rlm: RlmQuery | None = None
+        self._python_executable = python_executable
+        self._package_site_base = package_site_base
+        self._installer_factory = installer_factory or (
+            lambda executable, target: PackageInstaller(executable=executable, target=target)
+        )
         self._kernel_factory = kernel_factory or self._default_kernel
         self._kernel: Kernel | None = None
         self._tool: AgentTool | None = None
@@ -321,6 +354,8 @@ class CodeMode:
             max_concurrent_rlms=DEFAULT_MAX_CONCURRENT_RLMS,
             cell_timeout_seconds=self._cell_timeout,
             limits=self._limits,
+            python_executable=self._python_executable,
+            package_site_base=self._package_site_base,
         )
 
     def _kernel_or_new(self) -> Kernel:
@@ -375,6 +410,7 @@ class CodeMode:
             raise ToolInputError("Cell cancelled")
 
         kernel = self._kernel_or_new()
+        install = await self._install_packages(kernel, _install_arg(arguments))
         attachments = await self._attach(kernel, _attach_arg(arguments))
         bridge = self._subcall
         rlm = self._rlm
@@ -404,7 +440,46 @@ class CodeMode:
             timeout=timeout,
             attachments=attachments,
             recursion=recursion,
+            install=install,
         )
+
+    async def _install_packages(
+        self, kernel: Kernel, specs: tuple[str, ...]
+    ) -> InstallReport | None:
+        """Install requirement specs into the kernel's own package environment.
+
+        The kernel starts here if it has not already, because only the kernel
+        knows which interpreter it runs and which site directory that interpreter
+        searches: an installer that guessed either could put packages somewhere
+        the model would never find them. The kernel is never restarted for an
+        install either -- its site directory is on the child's path from the
+        moment it starts, so the next import sees what landed, and the namespace
+        the model built while asking for the package survives the install.
+        """
+        if not specs:
+            return None
+        if not kernel.alive:
+            await kernel.start()
+        sites = kernel.package_site_dirs
+        if not sites:
+            raise ToolInputError(
+                "this session's kernel has no package environment, so install "
+                "cannot run; point codeModePython at an interpreter that already "
+                "has the package, or do that work through bash"
+            )
+        installer = self._installer_factory(kernel.python_executable, sites[0])
+        try:
+            report = await installer.install(specs)
+        except PackageInstallError as exc:
+            raise ToolInputError(str(exc)) from exc
+        if not report.ok:
+            detail = report.output.strip() or report.error or "the resolver gave no reason"
+            raise ToolInputError(
+                f"install of {', '.join(report.specs)} failed: {detail}\n"
+                "The kernel environment is unchanged; retry with a different spec, "
+                "or use bash with an interpreter that already has the package."
+            )
+        return report
 
     async def _watch_cancellation(self, kernel: Kernel, signal: ToolCancellationToken) -> None:
         """Abort the cell when the harness cancels it.
@@ -431,6 +506,15 @@ def _render_call(arguments: Mapping[str, JSONValue]) -> str | None:
     return first
 
 
+def _install_note(report: InstallReport) -> str:
+    """One line on what was installed and where, so the model trusts the path."""
+    parts = [f"installed {', '.join(report.specs)}"]
+    if report.resolver:
+        parts.append(f"via {Path(report.resolver).name}")
+    parts.append(f"into {report.target} ({report.seconds:g}s)")
+    return f"[package environment: {' '.join(parts)}]"
+
+
 def _describe(
     result: CellResult,
     totals: SubcallTotals | None,
@@ -439,8 +523,11 @@ def _describe(
     timeout: float,
     attachments: Sequence[tuple[str, int]] = (),
     recursion: RlmTotals | None = None,
+    install: InstallReport | None = None,
 ) -> AgentToolResult:
     blocks: list[str] = []
+    if install is not None:
+        blocks.append(_install_note(install))
     output = result.stdout
     if result.stderr:
         output = f"{output}\n{result.stderr}" if output else result.stderr
@@ -581,6 +668,18 @@ def _attach_arg(arguments: Mapping[str, JSONValue]) -> Mapping[str, JSONValue]:
             "the namespace across cells."
         )
     return raw
+
+
+def _install_arg(arguments: Mapping[str, JSONValue]) -> tuple[str, ...]:
+    raw = arguments.get("install")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ToolInputError('install must be a list of package specs, such as ["numpy"]')
+    try:
+        return validate_specs(raw)
+    except PackageInstallError as exc:
+        raise ToolInputError(str(exc)) from exc
 
 
 async def _attach_one(kernel: Kernel, cwd: Path, name: object, raw: JSONValue) -> tuple[str, int]:

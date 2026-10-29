@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,7 +21,12 @@ import pytest
 from tau_coding.kernel import process as process_module
 from tau_coding.kernel.frames import encode_frame
 from tau_coding.kernel.process import MAX_CONTEXT_INDEX_BYTES, ProcessKernel, looks_secret
-from tau_coding.kernel.protocol import KernelLimits, KernelRejectedError, SubcallOutcome
+from tau_coding.kernel.protocol import (
+    KernelLimits,
+    KernelRejectedError,
+    KernelUnavailableError,
+    SubcallOutcome,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -569,3 +575,93 @@ async def test_close_releases_the_process(tmp_path: Path) -> None:
     state = await kernel.state()
     assert not state.alive
     assert state.note
+
+
+# -- the interpreter and its package environment -----------------------------
+#
+# Which interpreter a kernel runs on is configuration, and the package directory
+# is derived from that choice. These run real children because the claim under
+# test is exactly the one a fake would rubber-stamp: this interpreter started,
+# and it can import what was installed for it.
+
+
+async def test_a_configured_interpreter_is_the_one_that_runs(tmp_path: Path) -> None:
+    async with _running(tmp_path, python_executable=sys.executable) as kernel:
+        result = await kernel.execute("import sys\nprint(sys.prefix)")
+        assert result.ok, result.error
+        # Same prefix as the test process: the kernel really is on the
+        # interpreter it was configured with, not merely on some Python.
+        assert result.stdout.strip() == sys.prefix
+        assert kernel.python_executable
+
+
+async def test_an_interpreter_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
+    kernel = ProcessKernel(cwd=tmp_path, python_executable=str(tmp_path / "not-a-python"))
+    with pytest.raises(KernelUnavailableError, match="cannot start the kernel"):
+        await kernel.start()
+    assert not kernel.alive
+
+
+async def test_an_interpreter_that_cannot_answer_is_refused_before_spawn(
+    tmp_path: Path,
+) -> None:
+    # With a package environment configured, the host asks the interpreter what
+    # it is before spawning, because the answer names the site directory. /bin/true
+    # answers nothing, so the kernel stops there with a reason rather than
+    # starting a child that cannot import anything.
+    kernel = ProcessKernel(
+        cwd=tmp_path, python_executable="/bin/true", package_site_base=tmp_path / "site"
+    )
+    with pytest.raises(KernelUnavailableError, match="malformed interpreter identity"):
+        await kernel.start()
+    assert not kernel.alive
+
+
+async def test_kernels_on_one_interpreter_share_one_package_directory(tmp_path: Path) -> None:
+    base = tmp_path / "kernel-site"
+    async with _running(tmp_path, package_site_base=base) as first:
+        assert len(first.package_site_dirs) == 1
+        assert first.package_site_dirs[0].is_relative_to(base)
+        assert first.package_site_dirs[0].is_dir()
+    async with _running(tmp_path, package_site_base=base) as second:
+        assert second.package_site_dirs == first.package_site_dirs
+    # One directory per interpreter, not per kernel: the environment a session
+    # built is the environment the next session on this machine inherits.
+    assert sorted(base.iterdir()) == list(first.package_site_dirs)
+
+
+async def test_a_kernel_without_a_package_base_has_no_site_directories(
+    tmp_path: Path,
+) -> None:
+    async with _running(tmp_path) as kernel:
+        assert kernel.package_site_dirs == ()
+        result = await kernel.execute(
+            "import sys\nprint([p for p in sys.path if 'site-packages' in p and 'kernel' in p])"
+        )
+        assert result.ok, result.error
+        assert result.stdout.strip() == "[]"
+
+
+async def test_packages_that_land_in_the_site_directory_are_importable(
+    tmp_path: Path,
+) -> None:
+    """The guarantee an install rests on, without running a resolver.
+
+    A resolver is a network client and does not belong in a test suite, but what
+    every resolver has to deliver is a module inside a directory the kernel
+    already searches -- including one the kernel looked at and found empty.
+    """
+    base = tmp_path / "kernel-site"
+    async with _running(tmp_path, package_site_base=base) as kernel:
+        site = kernel.package_site_dirs[0]
+        missing = await kernel.execute("import late_package")
+        assert not missing.ok
+        assert "late_package" in (missing.error or "")
+
+        (site / "late_package.py").write_text(
+            "MARK = 'landed after the kernel started'\n", encoding="utf-8"
+        )
+
+        found = await kernel.execute("import late_package\nprint(late_package.MARK)")
+        assert found.ok, found.error
+        assert found.stdout.strip() == "landed after the kernel started"

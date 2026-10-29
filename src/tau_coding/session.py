@@ -243,6 +243,17 @@ async def _finish_adopted_code_mode_close(code_mode: CodeMode | None) -> None:
         task.result()
 
 
+def _turn_ends_on_tool_calls(event: TurnEndEvent) -> bool:
+    """True when a turn ended on tool calls, meaning the loop is still open.
+
+    ``TurnEndEvent.message`` is the full message union, so the assistant check
+    is spelled out rather than assumed: mid-turn compaction only matters for a
+    turn that will be followed by another model request.
+    """
+    message = event.message
+    return isinstance(message, AssistantMessage) and bool(message.tool_calls)
+
+
 def _wire_code_mode_recursion(
     code_mode: CodeMode,
     bridge: SubcallBridge,
@@ -251,6 +262,8 @@ def _wire_code_mode_recursion(
     max_depth: int,
     max_turns: int = 3,
     max_children_per_cell: int = 4,
+    python_executable: str | None = None,
+    package_site_base: Path | None = None,
 ) -> None:
     """Give a session's code mode the recursion bindings.
 
@@ -274,6 +287,11 @@ def _wire_code_mode_recursion(
                 # The recursion enforces the per-turn budget; this is the backstop
                 # for a child cell that ignores it.
                 cell_timeout_seconds=DEFAULT_CHILD_CELL_TIMEOUT_SECONDS + 5.0,
+                # A child solves the parent's task, so it needs the parent's
+                # interpreter and the packages installed for it -- a child on a
+                # different interpreter would rediscover the missing imports.
+                python_executable=python_executable,
+                package_site_base=package_site_base,
             ),
             limits=RlmLimits(
                 max_depth=max_depth,
@@ -475,6 +493,24 @@ class CodingSessionConfig:
     name like any other, and an extension may replace it by registering a tool of
     the same name. ``False`` skips the kernel entirely, which is what a restricted
     subagent type should use when it must not execute arbitrary Python.
+    """
+    code_mode_python: str | None = None
+    """Interpreter the code-mode kernel runs on, defaulting to Tau's own.
+
+    Worth setting when the data work the model does needs packages Tau's own
+    environment does not carry: a kernel started on an interpreter that already
+    has numpy beats any install. It decides which package environment the kernel
+    sees, because those directories are keyed per interpreter.
+    """
+    code_mode_package_site_dir: Path | None = field(
+        default_factory=lambda: TauPaths().home / "kernel-site"
+    )
+    """Base for the kernel's installed packages, or ``None`` for no environment.
+
+    A kernel uses a child directory keyed to its interpreter's implementation and
+    minor version, created on first use and put on the child's ``PYTHONPATH``.
+    Installs live in a directory rather than in the interpreter, so they survive
+    a killed kernel, a restart of Tau, and a user who wants them gone.
     """
     skills_enabled: bool = True
     """Whether skill discovery is enabled for this session.
@@ -824,6 +860,8 @@ class CodingSession:
             else CodeMode(
                 cwd=config.cwd,
                 recursion_enabled=config.code_mode_recursion_enabled,
+                python_executable=config.code_mode_python,
+                package_site_base=config.code_mode_package_site_dir,
             )
         )
         if code_mode is not None:
@@ -885,6 +923,8 @@ class CodingSession:
                     bridge,
                     cwd=config.cwd,
                     max_depth=config.code_mode_rlm_max_depth,
+                    python_executable=config.code_mode_python,
+                    package_site_base=config.code_mode_package_site_dir,
                 )
         if previous_runtime is not None:
             extension_runtime.set_ui_bridge(previous_runtime.ui)
@@ -2588,6 +2628,8 @@ class CodingSession:
             self._code_mode = CodeMode(
                 cwd=self._config.cwd,
                 recursion_enabled=self._config.code_mode_recursion_enabled,
+                python_executable=self._config.code_mode_python,
+                package_site_base=self._config.code_mode_package_site_dir,
             )
             bridge = SubcallBridge(
                 provider=lambda: self._harness.config.provider,
@@ -2600,6 +2642,8 @@ class CodingSession:
                     bridge,
                     cwd=self._config.cwd,
                     max_depth=self._config.code_mode_rlm_max_depth,
+                    python_executable=self._config.code_mode_python,
+                    package_site_base=self._config.code_mode_package_site_dir,
                 )
             self._code_mode.bind_context(ContextEntries(rows=self._active_context_rows))
         return self._code_mode.tool()
@@ -3044,6 +3088,8 @@ class CodingSession:
                 code_mode_enabled=self._config.code_mode_enabled,
                 code_mode_recursion_enabled=self._config.code_mode_recursion_enabled,
                 code_mode_rlm_max_depth=self._config.code_mode_rlm_max_depth,
+                code_mode_python=self._config.code_mode_python,
+                code_mode_package_site_dir=self._config.code_mode_package_site_dir,
                 skills_enabled=self._config.skills_enabled,
                 allowed_tool_names=self._config.allowed_tool_names,
                 extension_paths=self._config.extension_paths,
@@ -3633,7 +3679,7 @@ class CodingSession:
                     auto_name_message = event.message.text
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
-                if isinstance(event, TurnEndEvent) and event.message.tool_calls:
+                if isinstance(event, TurnEndEvent) and _turn_ends_on_tool_calls(event):
                     self._invalidate_context_usage_cache()
                     # Long tool turns can cross the compaction threshold with
                     # no user prompt in between; compact mid-turn so the next
@@ -3702,7 +3748,9 @@ class CodingSession:
                     async for retry_event in events:
                         if isinstance(retry_event, ToolExecutionEndEvent):
                             self._invalidate_context_usage_cache()
-                        if isinstance(retry_event, TurnEndEvent) and retry_event.message.tool_calls:
+                        if isinstance(retry_event, TurnEndEvent) and _turn_ends_on_tool_calls(
+                            retry_event
+                        ):
                             self._invalidate_context_usage_cache()
                             # Long tool turns can cross the compaction threshold
                             # with no user prompt in between; compact mid-turn
@@ -3783,7 +3831,7 @@ class CodingSession:
             async for event in events:
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
-                if isinstance(event, TurnEndEvent) and event.message.tool_calls:
+                if isinstance(event, TurnEndEvent) and _turn_ends_on_tool_calls(event):
                     self._invalidate_context_usage_cache()
                     # Long tool turns can cross the compaction threshold with
                     # no user prompt in between; compact mid-turn so the next

@@ -124,6 +124,48 @@ def test_recursion_survives_a_session_without_code_mode() -> None:
     assert settings.code_mode_recursion is True
 
 
+def test_the_kernel_interpreter_is_inherited_by_default() -> None:
+    # Tau's own interpreter is the default because it already has tau importable
+    # and needs no setup; naming another one is a deliberate act.
+    assert ShellSettings().code_mode_python is None
+    assert "codeModePython" not in ShellSettings().to_json()
+
+
+def test_a_configured_kernel_interpreter_round_trips() -> None:
+    settings = shell_settings_from_json({"codeModePython": "/usr/bin/python3.12"})
+    assert settings.code_mode_python == "/usr/bin/python3.12"
+    assert settings.to_json() == {"codeModePython": "/usr/bin/python3.12"}
+
+
+def test_the_kernel_interpreter_accepts_the_snake_case_alias() -> None:
+    assert shell_settings_from_json({"code_mode_python": "pypy3"}).code_mode_python == "pypy3"
+
+
+def test_the_kernel_interpreter_refuses_both_spellings_at_once() -> None:
+    with pytest.raises(ShellConfigError, match="codeModePython"):
+        shell_settings_from_json({"codeModePython": "python3", "code_mode_python": "python3"})
+
+
+def test_the_kernel_interpreter_must_be_a_name_or_null() -> None:
+    with pytest.raises(ShellConfigError, match="codeModePython"):
+        shell_settings_from_json({"codeModePython": 3})
+    # null is how a user says "back to Tau's own interpreter"; a blank name is
+    # not a name, so both mean the same thing and neither blocks the tool.
+    assert shell_settings_from_json({"codeModePython": None}).code_mode_python is None
+    assert shell_settings_from_json({"codeModePython": "   "}).code_mode_python is None
+
+
+def test_the_kernel_interpreter_is_read_from_the_durable_settings_file(
+    tmp_path: Path,
+) -> None:
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    path = shell_settings_path(paths)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"codeModePython": "python3.12"}', encoding="utf-8")
+
+    assert load_shell_settings(paths).code_mode_python == "python3.12"
+
+
 def test_recursion_is_read_from_the_durable_settings_file(tmp_path: Path) -> None:
     paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
     path = shell_settings_path(paths)

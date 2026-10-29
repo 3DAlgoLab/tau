@@ -9,7 +9,7 @@ namespace survives ``/reload``, and closing the session closes the process.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,6 +29,7 @@ from tau_coding.code_mode import (
     CodeMode,
 )
 from tau_coding.context_entries import ContextEntries
+from tau_coding.kernel.packages import InstallReport, PackageInstaller, validate_specs
 from tau_coding.kernel.process import ProcessKernel
 from tau_coding.kernel.protocol import ENV_CONNECT_TIMEOUT, SubcallOutcome
 from tau_coding.kernel.scaffold import RESERVED
@@ -437,6 +438,140 @@ def test_context_handles_are_bindings_not_tool_arguments(tmp_path: Path) -> None
     assert "context" not in tool.parameters["properties"]
     assert "context_index()" in tool.description
     assert any("context_open" in line for line in tool.prompt_guidelines)
+
+
+# -- the package environment (install) --------------------------------------
+
+
+class _FakeResolver(PackageInstaller):
+    """Stand in for uv and pip: write a module into the target, fetch nothing.
+
+    The install behaviour under test is ordering and durability -- what the tool
+    asks the resolver, when, and where the result has to land. The download
+    itself belongs to pip and is not this suite's to depend on.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(executable="fake-resolver", target=Path("."))
+        self.targets: list[Path] = []
+        self.spec_requests: list[tuple[str, ...]] = []
+
+    def __call__(self, executable: str, target: Path) -> _FakeResolver:
+        # The factory seam: the kernel's own interpreter and its site directory,
+        # which is the whole reason a kernel starts before an install runs.
+        self._executable = executable
+        self._target = target
+        self.targets.append(target)
+        return self
+
+    async def install(self, specs: Sequence[object]) -> InstallReport:
+        checked = validate_specs(specs)
+        self.spec_requests.append(checked)
+        target = self._target
+        if checked and checked[0] != "missing-probe":
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "installed_probe.py").write_text(
+                "MARK = 'written where the kernel looks'\n", encoding="utf-8"
+            )
+            note = "Installed 1 package"
+            ok, error = True, None
+        else:
+            note = "uv: no version of missing-probe matches this interpreter"
+            ok, error = False, "no resolver on this machine could install the request"
+        return InstallReport(
+            ok=ok,
+            target=target,
+            specs=checked,
+            commands=(("fake-resolver", "install", *checked),),
+            output=note,
+            error=error,
+            seconds=0.2,
+            resolver="fake-resolver",
+        )
+
+
+async def test_install_lands_before_the_cell_that_imports_it(tmp_path: Path) -> None:
+    resolver = _FakeResolver()
+    base = tmp_path / "kernel-site"
+    async with _mode(cwd=tmp_path, package_site_base=base, installer_factory=resolver) as mode:
+        result = await _cell(
+            mode,
+            "import installed_probe\nprint(installed_probe.MARK)",
+            install=["installed-probe"],
+        )
+        text = _text(result)
+        assert "written where the kernel looks" in text
+        # The note names the directory, so a later cell can trust the path.
+        assert "package environment" in text
+        assert str(base) in text
+        assert resolver.spec_requests == [("installed-probe",)]
+        assert resolver.targets == [next(base.iterdir())]
+
+
+async def test_an_installed_package_outlives_the_kernel_that_installed_it(
+    tmp_path: Path,
+) -> None:
+    """The point of a package environment, stated once and pinned.
+
+    A cell that had to install numpy every session would not be worth the
+    namespace it keeps, so the environment is keyed to the interpreter and lives
+    in a directory, not in the child process.
+    """
+    base = tmp_path / "kernel-site"
+    async with _mode(
+        cwd=tmp_path, package_site_base=base, installer_factory=_FakeResolver()
+    ) as first:
+        installed = await _cell(
+            first,
+            "import installed_probe\nprint(installed_probe.MARK)",
+            install=["installed-probe"],
+        )
+        assert "written where the kernel looks" in _text(installed)
+
+    second_resolver = _FakeResolver()
+    async with _mode(
+        cwd=tmp_path, package_site_base=base, installer_factory=second_resolver
+    ) as second:
+        result = await _cell(second, "import installed_probe\nprint(installed_probe.MARK)")
+        assert "written where the kernel looks" in _text(result)
+        assert second_resolver.spec_requests == []
+
+
+async def test_a_spec_that_reads_as_an_option_is_refused(tmp_path: Path) -> None:
+    resolver = _FakeResolver()
+    async with _mode(
+        cwd=tmp_path, package_site_base=tmp_path / "site", installer_factory=resolver
+    ) as mode:
+        with pytest.raises(ToolInputError, match="dash"):
+            await _cell(mode, "print('ran')", install=["--target=/tmp/elsewhere"])
+        assert resolver.spec_requests == []
+
+
+async def test_a_failed_install_reports_the_resolver_and_skips_the_cell(
+    tmp_path: Path,
+) -> None:
+    resolver = _FakeResolver()
+    async with _mode(
+        cwd=tmp_path, package_site_base=tmp_path / "site", installer_factory=resolver
+    ) as mode:
+        with pytest.raises(ToolInputError, match="no version of missing-probe"):
+            await _cell(mode, "open('side-effect', 'w')", install=["missing-probe"])
+        assert not (tmp_path / "side-effect").exists()
+
+
+async def test_install_without_a_package_environment_says_so(tmp_path: Path) -> None:
+    resolver = _FakeResolver()
+    async with _mode(cwd=tmp_path, installer_factory=resolver) as mode:
+        with pytest.raises(ToolInputError, match="no package environment"):
+            await _cell(mode, "print(1)", install=["numpy"])
+        assert resolver.spec_requests == []
+
+
+async def test_install_is_advertised_where_the_model_reads(tmp_path: Path) -> None:
+    tool = CodeMode(cwd=tmp_path).tool()
+    assert "install" in tool.parameters["properties"]
+    assert 'install(["numpy"])' in tool.description
+    assert any("install" in line for line in tool.prompt_guidelines)
 
 
 # -- session scope ----------------------------------------------------------

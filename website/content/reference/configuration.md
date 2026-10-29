@@ -82,6 +82,15 @@ disable it. One-shot hosts that build their own tool list never gain the tool
 automatically.
 
 
+`settings.json` may also contain `"codeModePython": "python3.12"`. The code-mode
+kernel runs on Tau's own interpreter unless this names another one -- a command
+name or an absolute path resolved on this machine. Naming one is an ABI decision:
+the kernel asks the interpreter what it is before starting, refuses to start if it
+cannot answer, and keeps the package environment of each interpreter separate
+(see [Tools](/reference/tools/)). `null` or a blank value returns to Tau's own
+interpreter. Tau does not install interpreters; if the name is not on this
+machine, the tool reports that instead of picking a substitute.
+
 `settings.json` may also contain `"codeModeRecursion": true | false` (default
 `false`). It adds `rlm_query` / `rlm_query_batched` to the code-mode namespace: a
 recursion hands a task to a child with a kernel of its own, bounded by a turn

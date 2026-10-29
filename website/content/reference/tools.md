@@ -129,6 +129,7 @@ Runs Python in a kernel that stays alive for the whole session.
 | `description` | yes | string | Short summary of what the cell does. |
 | `timeout` | no | number | Per-cell budget in seconds (default 30). It measures the cell's own code: time spent inside `llm_query`/`rlm_query` belongs to the host and is not charged. Overrunning kills the cell **and its namespace**. |
 | `attach` | no | object | `{"name": "path"}`: bind existing files in the namespace as **paths** to open. Names must be Python identifiers; paths may be relative to the session cwd. Contents stay on disk. |
+| `install` | no | array | `["numpy", "scipy==1.15"]`: add packages to this kernel's Python environment **before** the cell runs, so the cell can import them. A list of package specs, never a shell command; a request that cannot be installed fails the call before your code runs, and the resolver's own words come back. |
 
 Names bound in one call -- variables, imports, functions, objects -- are still
 bound in the next, so a 5 MB list can stay in the kernel while only the slice the
@@ -160,6 +161,14 @@ model decided matters comes back. Inside a cell:
   and when the index or a slice must shrink the reply says which rows and how many
   bytes. The session binds the context -- not the tool call -- so a cell can ask
   about the transcript it is standing in without paying for the transcript.
+
+`install` writes into a directory keyed to the kernel's interpreter
+(`~/.tau/kernel-site/<implementation>-<version>/`), so an environment built in one
+session is still there after a kernel kill, a compaction, or the session ending --
+durability a namespace cannot offer, since a kernel restart discards every bound
+name. It is keyed to the interpreter on purpose: an environment built for one ABI
+is not handed to another. Tau prefers `uv` when it is on the machine and falls
+back to that interpreter's own `pip`, and it never installs without being asked.
 
 The kernel is a separate Python process with no provider credentials in its
 environment and byte-bounded output. That boundary keeps model-written code from

@@ -245,6 +245,20 @@ class Kernel(Protocol):
         """Times the kernel was restarted after being killed."""
         ...
 
+    @property
+    def python_executable(self) -> str:
+        """The interpreter the kernel runs on, as the host resolved it."""
+        ...
+
+    @property
+    def package_site_dirs(self) -> tuple[Path, ...]:
+        """Site directories the kernel searches for installed packages.
+
+        Empty means this kernel has no package environment, which is what makes
+        a package request reportable instead of mysterious.
+        """
+        ...
+
     async def start(self) -> None:
         """Start the kernel, or restart it after it was killed."""
         ...
