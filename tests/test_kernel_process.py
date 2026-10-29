@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from tau_coding.kernel.frames import encode_frame
-from tau_coding.kernel.process import ProcessKernel, looks_secret
+from tau_coding.kernel.process import MAX_CONTEXT_INDEX_BYTES, ProcessKernel, looks_secret
 from tau_coding.kernel.protocol import KernelLimits, KernelRejectedError, SubcallOutcome
 
 pytestmark = pytest.mark.anyio
@@ -151,6 +151,124 @@ async def test_a_kernel_without_a_subcall_handler_says_so(tmp_path: Path) -> Non
         result = await kernel.execute("llm_query('anything')")
         assert not result.ok
         assert "no sub-call handler is wired" in (result.error or "")
+
+
+class _FakeContext:
+    """A stand-in for the session rows behind a ``context_index``/``open`` handle.
+
+    The point of the fake is what it *does not* do: it hands the kernel a path, never
+    the history itself, so the tests can watch the bytes arrive through the file.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: Path = Path("/tmp/tau-context-fake.jsonl"),
+        index_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.index_query: list[str | None] = []
+        self.open_refs: list[tuple[str, ...]] = []
+        self.path = path
+        self.index_rows = (
+            index_rows
+            if index_rows is not None
+            else [
+                {
+                    "address": 1,
+                    "entry_id": "e1",
+                    "role": "user",
+                    "bytes": 11,
+                    "preview": "first ask",
+                },
+                {
+                    "address": 2,
+                    "entry_id": "e2",
+                    "role": "assistant",
+                    "bytes": 13,
+                    "preview": "first answer",
+                },
+            ]
+        )
+
+    async def index(self, query: str | None) -> dict[str, Any]:
+        self.index_query.append(query)
+        return {"rows": list(self.index_rows), "total": len(self.index_rows), "omitted": 0}
+
+    async def open(self, refs: tuple[str, ...]) -> dict[str, Any]:
+        self.open_refs.append(refs)
+        path = self.path
+        path.write_text(
+            '{"address": 1, "text": "the transcript, host-written"}\n',
+            encoding="utf-8",
+        )
+        return {"path": str(path), "written": 1, "omitted": 0, "note": "1 entry"}
+
+
+async def test_context_handles_round_trip_from_inside_a_cell(tmp_path: Path) -> None:
+    context = _FakeContext(path=tmp_path / "slice.jsonl")
+    async with _running(tmp_path, context=context) as kernel:
+        result = await kernel.execute(
+            "info = context_index('answer')\n"
+            "print(info['total'])\n"
+            "path = context_open('#1-#2')\n"
+            "print(open(path).read().strip())\n"
+            "print(SHOW_VARS()['context_open'] == 'function')"
+        )
+        assert result.ok, result.error
+        assert "2\n" in result.stdout
+        assert "the transcript, host-written" in result.stdout
+        assert context.index_query == ["answer"]
+        assert context.open_refs == [("#1-#2",)]
+        assert kernel.context_reads == 2
+
+
+async def test_a_kernel_without_a_context_source_says_so(tmp_path: Path) -> None:
+    async with _running(tmp_path) as kernel:
+        result = await kernel.execute("context_index()")
+        assert not result.ok
+        assert "no session context is wired" in (result.error or "")
+        assert kernel.alive
+
+
+async def test_context_refs_are_refused_before_the_source_sees_them(tmp_path: Path) -> None:
+    context = _FakeContext()
+    async with _running(tmp_path, context=context) as kernel:
+        result = await kernel.execute("context_open(*['#1'] * 40)")
+        assert not result.ok
+        assert "the limit is 32" in (result.error or "")
+        assert context.open_refs == []
+        assert kernel.alive
+
+        refused = await kernel.execute("context_open(7)")
+        assert not refused.ok
+        assert "references such as" in (refused.error or "")
+        assert context.open_refs == []
+
+
+async def test_an_oversized_index_is_trimmed_with_the_drop_counted(tmp_path: Path) -> None:
+    context = _FakeContext(
+        index_rows=[
+            {
+                "address": index,
+                "entry_id": f"e{index}",
+                "role": "user",
+                "bytes": 5,
+                "preview": "z" * 200,
+            }
+            for index in range(1, 1201)
+        ]
+    )
+    async with _running(tmp_path, context=context) as kernel:
+        assert len(context.index_rows) * 200 > MAX_CONTEXT_INDEX_BYTES
+        result = await kernel.execute(
+            "info = context_index()\n"
+            "print(len(info['rows']), info['omitted'], info.get('note', ''))"
+        )
+        assert result.ok, result.error
+        listed, dropped = result.stdout.split()[0], int(result.stdout.split()[1])
+        assert int(listed) < 1200
+        assert dropped >= 1200 - int(listed)
+        assert "trimmed" in result.stdout
 
 
 async def test_credentials_do_not_cross_into_the_kernel(

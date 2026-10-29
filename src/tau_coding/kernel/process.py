@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import secrets
 import sys
@@ -36,6 +37,8 @@ from tau_coding.kernel.protocol import (
     ENV_TOKEN,
     HOST_DEFAULT,
     OP_BIND,
+    OP_CONTEXT,
+    OP_CONTEXT_REPLY,
     OP_DONE,
     OP_EXEC,
     OP_HELLO,
@@ -49,6 +52,7 @@ from tau_coding.kernel.protocol import (
     OP_SUBCALL_BATCHED,
     OP_SUBCALL_REPLY,
     CellResult,
+    ContextSource,
     KernelError,
     KernelLimits,
     KernelRejectedError,
@@ -66,6 +70,11 @@ DEFAULT_STARTUP_TIMEOUT_SECONDS = 20.0
 CONTROL_TIMEOUT_SECONDS = 5.0
 DEFAULT_CELL_OUTPUT_BYTES = 64 * 1024
 DEFAULT_RAW_TAIL_BYTES = 4096
+
+# A context index is a listing the cell prints, not data it processes, so it is
+# kept far under the frame ceiling; a slice never travels at all, only its path.
+MAX_CONTEXT_REFS = 32
+MAX_CONTEXT_INDEX_BYTES = 96 * 1024
 
 _SECRET_MARKERS = (
     "API_KEY",
@@ -203,6 +212,7 @@ class ProcessKernel:
         *,
         cwd: Path,
         subcall: SubcallFn | None = None,
+        context: ContextSource | None = None,
         max_concurrent_subcalls: int = 4,
         cell_timeout_seconds: float = DEFAULT_CELL_TIMEOUT_SECONDS,
         startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
@@ -213,6 +223,7 @@ class ProcessKernel:
     ) -> None:
         self._cwd = cwd
         self._subcall = subcall
+        self._context = context
         self._max_concurrent_subcalls = max(1, max_concurrent_subcalls)
         self._cell_timeout = cell_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
@@ -239,6 +250,7 @@ class ProcessKernel:
         self._closed = False
         self._cells_run = 0
         self._subcalls_used = 0
+        self._context_reads = 0
         self._restarts = 0
         self._ever_started = False
         self._dead_reason: str | None = None
@@ -254,6 +266,11 @@ class ProcessKernel:
     def subcalls_used(self) -> int:
         """Sub-completions served for this kernel, counting failures."""
         return self._subcalls_used
+
+    @property
+    def context_reads(self) -> int:
+        """Context index and slice requests served for this kernel."""
+        return self._context_reads
 
     @property
     def cells_run(self) -> int:
@@ -548,6 +565,83 @@ class ProcessKernel:
                 except FrameError as exc:
                     await self._stop(f"the sub-call reply never reached the kernel: {exc}")
                     return
+            elif op == OP_CONTEXT:
+                reply = await self._serve_context(frame)
+                try:
+                    await write_frame(
+                        writer,
+                        {"op": OP_CONTEXT_REPLY, "req_id": frame.get("req_id", ""), **reply},
+                    )
+                except FrameError as exc:
+                    await self._stop(f"the context reply never reached the kernel: {exc}")
+                    return
+
+    async def _serve_context(self, frame: Mapping[str, Any]) -> dict[str, Any]:
+        """Answer a context request from inside a cell.
+
+        A context reply is deliberately small: index rows are counted and
+        clipped here, and a slice is a **path** the child reads by itself. The
+        one thing this layer guarantees is that no reply can grow past what the
+        frame channel carries -- an oversized index is trimmed with the drop
+        counted, because silently half-listing a history the model is reading is
+        worse than saying so.
+        """
+
+        if self._closing:
+            return {"error": "the kernel channel is closing"}
+        if self._context is None:
+            return {
+                "error": (
+                    "no session context is wired to this kernel, so "
+                    "context_index()/context_open() have nothing to answer"
+                )
+            }
+        self._context_reads += 1
+        action = str(frame.get("action", ""))
+        try:
+            if action == "index":
+                query = frame.get("query")
+                if query is not None and not isinstance(query, str):
+                    return {"error": "a context index query must be a string or null"}
+                reply: dict[str, Any] = dict(await self._context.index(query))
+                reply = self._trim_index(reply)
+            elif action == "open":
+                refs = frame.get("refs")
+                if not isinstance(refs, list) or not refs:
+                    return {"error": "context_open needs a non-empty list of refs"}
+                if len(refs) > MAX_CONTEXT_REFS:
+                    return {
+                        "error": (
+                            f"{len(refs)} refs in one context_open() call, the limit is "
+                            f"{MAX_CONTEXT_REFS}; name fewer ranges or take 'all' and "
+                            "slice the file inside the cell"
+                        )
+                    }
+                if any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+                    return {"error": "every context ref must be a non-empty string"}
+                reply = dict(await self._context.open(tuple(ref.strip() for ref in refs)))
+            else:
+                return {"error": f"unsupported context action {action!r}"}
+        except Exception as exc:  # noqa: BLE001 - the cell sees the reason, the kernel lives
+            return {"error": f"context request failed: {type(exc).__name__}: {exc}"}
+        return reply
+
+    def _trim_index(self, reply: dict[str, Any]) -> dict[str, Any]:
+        """Drop index rows from the tail until the reply fits one frame."""
+        rows = reply.get("rows")
+        if not isinstance(rows, list):
+            return reply
+        dropped = 0
+        while len(rows) > 1 and len(json.dumps(rows, ensure_ascii=False).encode("utf-8")) > (
+            MAX_CONTEXT_INDEX_BYTES
+        ):
+            rows.pop()
+            dropped += 1
+        if dropped:
+            reply["rows"] = rows
+            reply["omitted"] = int(reply.get("omitted", 0)) + dropped
+            reply["note"] = f"index trimmed by {dropped} rows to fit the frame limit"
+        return reply
 
     async def _serve_subcall(self, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Serve one sub-call request from inside a cell."""

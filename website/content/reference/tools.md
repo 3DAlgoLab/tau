@@ -144,6 +144,14 @@ model decided matters comes back. Inside a cell:
 - `attach({"name": "path"})` on the tool call binds a file the cell can `open()`;
   the file's bytes never enter the prompt. Handles belong to the namespace, so a
   cell after a kernel kill must restate them.
+- `context_index()` and `context_open(refs)` read the **session's own history** from
+  inside the cell. The index describes the active context in bounded rows carrying
+  the same `(#N)` addresses a compaction summary cites; `context_open("#8-#19")`, or
+  `"last:10"`, `"first:3"`, `"all"`, an entry id, writes those entries to a JSONL
+  file and returns its path to `open()`. Entry bodies never come back as payload,
+  and when the index or a slice must shrink the reply says which rows and how many
+  bytes. The session binds the context -- not the tool call -- so a cell can ask
+  about the transcript it is standing in without paying for the transcript.
 
 The kernel is a separate Python process with no provider credentials in its
 environment and byte-bounded output. That boundary keeps model-written code from

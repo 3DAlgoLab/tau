@@ -42,6 +42,8 @@ from tau_coding.kernel.protocol import (
     ENV_TOKEN,
     HOST_DEFAULT,
     OP_BIND,
+    OP_CONTEXT,
+    OP_CONTEXT_REPLY,
     OP_DONE,
     OP_EXEC,
     OP_HELLO,
@@ -58,6 +60,8 @@ from tau_coding.kernel.protocol import (
 )
 from tau_coding.kernel.scaffold import (
     BINDINGS,
+    CONTEXT_INDEX,
+    CONTEXT_OPEN,
     LLM_QUERY,
     LLM_QUERY_BATCHED,
     RESERVED,
@@ -126,8 +130,11 @@ class _Channel:
                 raise KernelSubcallError(f"sub-call reply was malformed: {exc}") from exc
             if reply is None:
                 raise KernelSubcallError("kernel channel closed mid-request")
-            if reply.get("op") != OP_SUBCALL_REPLY or reply.get("req_id") != req_id:
-                raise KernelSubcallError("unexpected frame while waiting for a sub-call reply")
+            if (
+                reply.get("op") not in (OP_SUBCALL_REPLY, OP_CONTEXT_REPLY)
+                or reply.get("req_id") != req_id
+            ):
+                raise KernelSubcallError("unexpected frame while waiting for a host reply")
             return reply
 
 
@@ -292,6 +299,8 @@ class _Kernel:
         ns["__builtins__"] = builtins
         ns[LLM_QUERY] = self._llm_query
         ns[LLM_QUERY_BATCHED] = self._llm_query_batched
+        ns[CONTEXT_INDEX] = self._context_index
+        ns[CONTEXT_OPEN] = self._context_open
         ns[SHOW_VARS] = self._show_vars
         ns[RET] = self._ret_noop
 
@@ -306,6 +315,35 @@ class _Kernel:
             for name, value in self._ns.items()
             if not name.startswith("_")
         }
+
+    def _context_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ask the host for context rows or a slice path, serialized like a sub-call."""
+        reply = self._channel.request({"op": OP_CONTEXT, **payload})
+        error = reply.get("error")
+        if error is not None:
+            raise KernelSubcallError(str(error))
+        return reply
+
+    def _context_index(self, query: str | None = None) -> dict[str, Any]:
+        if query is not None and not isinstance(query, str):
+            raise TypeError("context_index(query) needs a string or None")
+        return self._context_request({"action": "index", "query": query})
+
+    def _context_open(self, *refs: str) -> str:
+        named = [ref for ref in refs if isinstance(ref, str) and ref.strip()]
+        if not named:
+            raise TypeError(
+                "context_open(refs...) needs references such as '#3', '12-20', "
+                "'last:5', 'all', or an entry id"
+            )
+        reply = self._context_request({"action": "open", "refs": named})
+        path = reply.get("path")
+        if not isinstance(path, str) or not path:
+            raise KernelSubcallError("the context reply carried no file path")
+        note = reply.get("note")
+        if isinstance(note, str) and note:
+            print(f"[context] {note}")
+        return path
 
     def _ret_noop(self, value: object) -> None:  # pragma: no cover - replaced per cell
         del value

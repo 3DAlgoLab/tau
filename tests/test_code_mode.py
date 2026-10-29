@@ -17,7 +17,7 @@ import pytest
 
 from pi_event_helpers import assistant_done, assistant_start, text_delta
 from tau_agent.harness import SimpleCancellationToken
-from tau_agent.messages import AssistantMessage
+from tau_agent.messages import AssistantMessage, UserMessage
 from tau_agent.session import JsonlSessionStorage
 from tau_agent.tools import AgentToolResult, ToolCancellationToken
 from tau_agent.types import JSONValue
@@ -28,6 +28,7 @@ from tau_coding.code_mode import (
     PYTHON_REPL_TOOL_NAME,
     CodeMode,
 )
+from tau_coding.context_entries import ContextEntries
 from tau_coding.kernel.scaffold import RESERVED
 from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.session import CodingSession, CodingSessionConfig
@@ -291,6 +292,64 @@ async def test_an_oversized_handle_is_named_not_loaded(tmp_path: Path) -> None:
         assert mode._kernel is None or mode._kernel.cells_run == 0
 
 
+async def test_history_arrives_as_a_path_not_a_transcript(tmp_path: Path) -> None:
+    rows = [(f"e{index}", UserMessage(content=f"question {index}")) for index in range(1, 7)]
+    async with _mode(cwd=tmp_path, context=ContextEntries(rows=lambda: rows)) as mode:
+        result = await _cell(
+            mode,
+            "idx = context_index()\n"
+            "path = context_open('last:2')\n"
+            "print(idx['total'], len(open(path).read().splitlines()))",
+        )
+        assert "6 2" in _text(result)
+        # The point of the handle: the cell saw two entries, and neither of their
+        # bodies came back through the tool result.
+        assert "question 5" not in _text(result)
+
+
+async def test_the_context_view_follows_the_active_branch(tmp_path: Path) -> None:
+    # A compaction or a branch switch replaces the active rows; a cell that runs
+    # afterwards must search the context the next model call will see.
+    held: dict[str, list[tuple[str, UserMessage]]] = {
+        "rows": [("e1", UserMessage(content="before the cut"))]
+    }
+    context = ContextEntries(rows=lambda: held["rows"])
+    async with _mode(cwd=tmp_path, context=context) as mode:  # type: ignore[call-overload]
+        first = await _cell(mode, "print(context_index()['total'])")
+        assert "1" in _text(first)
+        held["rows"] = [
+            (f"e{index}", UserMessage(content=f"after {index}")) for index in range(1, 4)
+        ]
+        after = await _cell(mode, "print(context_index()['total'])")
+        assert "3" in _text(after)
+
+
+async def test_a_context_scratch_file_does_not_outlive_the_session(tmp_path: Path) -> None:
+    rows = [("e1", UserMessage(content="one entry"))]
+    mode = CodeMode(cwd=tmp_path, context=ContextEntries(rows=lambda: rows))
+    try:
+        written = await _cell(mode, "path = context_open('all')\nret({'path': path})")
+        path = Path(str(written.details["ret"]["path"]))
+        assert path.is_file()
+    finally:
+        await mode.dispose()
+    assert not path.exists()
+
+
+async def test_an_unwired_context_is_reported_to_the_cell(tmp_path: Path) -> None:
+    async with _mode(cwd=tmp_path) as mode:
+        result = await _cell(mode, "context_index()")
+        assert result.details["ok"] is False
+        assert "no session context is wired" in _text(result)
+
+
+def test_context_handles_are_bindings_not_tool_arguments(tmp_path: Path) -> None:
+    tool = CodeMode(cwd=tmp_path).tool()
+    assert "context" not in tool.parameters["properties"]
+    assert "context_index()" in tool.description
+    assert any("context_open" in line for line in tool.prompt_guidelines)
+
+
 # -- session scope ----------------------------------------------------------
 
 
@@ -304,6 +363,19 @@ def _session_config(tmp_path: Path, **kwargs: object) -> CodingSessionConfig:
         cwd=tmp_path,
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+async def test_a_session_cell_sees_the_session_own_history(tmp_path: Path) -> None:
+    # The session wires its own live context into the kernel, so a cell can ask
+    # about the transcript it is standing in without the transcript arriving.
+    session = await CodingSession.load(_session_config(tmp_path))
+    try:
+        mode = session.code_mode
+        assert mode is not None
+        result = await _cell(mode, "idx = context_index()\nprint(idx['total'], idx['rows'] == [])")
+        assert f"{len(session.state.messages)} True" in _text(result)
+    finally:
+        await session.aclose()
 
 
 async def test_python_repl_is_part_of_the_default_tool_set(tmp_path: Path) -> None:

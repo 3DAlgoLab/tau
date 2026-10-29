@@ -30,10 +30,12 @@ from pathlib import Path
 from tau_agent.messages import TextContent
 from tau_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, ToolUpdateCallback
 from tau_agent.types import JSONValue
+from tau_coding.context_entries import ContextEntries
 from tau_coding.kernel.frames import FrameError
 from tau_coding.kernel.process import ProcessKernel
 from tau_coding.kernel.protocol import (
     CellResult,
+    ContextSource,
     Kernel,
     KernelError,
     KernelLimits,
@@ -96,8 +98,9 @@ _REPL_DESCRIPTION = (
     "llm_query_batched(prompts, model=None) call the session's model from inside "
     "the cell; a batched failure comes back as None. attach({name: path}) "
     "binds existing files into the namespace as paths to open, so their bytes "
-    "never enter the prompt. A cell that exceeds its timeout is killed, which "
-    "also discards the namespace."
+    "never enter the prompt, and context_index()/context_open(refs) do the same "
+    "for the session's own history. A cell that exceeds its timeout is killed, "
+    "which also discards the namespace."
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
@@ -112,6 +115,9 @@ _REPL_GUIDELINES: tuple[str, ...] = (
     "end the cell with ret({...}) so the result comes back as data.",
     "Attach a file with attach({name: path}) instead of pasting its contents into "
     "the code: the bound name is a path you open inside the cell.",
+    "For conversation history use context_index() and context_open('#3-#9') rather "
+    "than asking for the transcript: you get a path to JSONL rows addressed the way "
+    "a compaction summary addresses them.",
     "Keep material in kernel variables and use llm_query/llm_query_batched to ask "
     "about it in chunks; bring back answers, not the corpus.",
     "A cell that overruns its timeout is killed together with its namespace, so split "
@@ -166,6 +172,7 @@ class CodeMode:
         *,
         cwd: Path,
         subcall: SubcallBridge | None = None,
+        context: ContextSource | None = None,
         limits: KernelLimits | None = None,
         cell_timeout_seconds: float = DEFAULT_CELL_TIMEOUT_SECONDS,
         max_concurrent_subcalls: int = 4,
@@ -174,6 +181,7 @@ class CodeMode:
     ) -> None:
         self._cwd = cwd
         self._subcall = subcall
+        self._context = context
         self._limits = limits
         self._cell_timeout = cell_timeout_seconds
         self._max_concurrent_subcalls = max(1, max_concurrent_subcalls)
@@ -199,6 +207,20 @@ class CodeMode:
             bridge.max_calls_per_cell = self._max_calls_per_cell
         self._subcall = bridge
 
+    def bind_context(self, source: ContextSource) -> None:
+        """Attach the session's live context for ``context_index``/``context_open``.
+
+        Same ordering rule as :meth:`bind_subcall`: the kernel captures the
+        source when it starts, so a session binds it before the first cell. The
+        source is a live view rather than a snapshot, because the context worth
+        searching is the one the next model call will see -- after a compaction
+        or a branch switch, not the one that existed at construction.
+        """
+
+        if self._kernel is not None:
+            raise RuntimeError("cannot bind a session context after this kernel has run a cell")
+        self._context = source
+
     def tool(self) -> AgentTool:
         """Return the session's ``python_repl`` tool."""
         if self._tool is None:
@@ -223,6 +245,9 @@ class CodeMode:
         self._kernel = None
         if kernel is not None:
             await kernel.close()
+        context = self._context
+        if isinstance(context, ContextEntries):
+            context.dispose()
 
     @property
     def started(self) -> bool:
@@ -238,6 +263,7 @@ class CodeMode:
         return ProcessKernel(
             cwd=self._cwd,
             subcall=self._subcall,
+            context=self._context,
             max_concurrent_subcalls=self._max_concurrent_subcalls,
             cell_timeout_seconds=self._cell_timeout,
             limits=self._limits,

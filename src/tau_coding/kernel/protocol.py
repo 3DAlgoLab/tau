@@ -39,6 +39,8 @@ OP_READY = "ready"
 OP_SUBCALL = "subcall"
 OP_SUBCALL_BATCHED = "subcall_batched"
 OP_SUBCALL_REPLY = "subcall_reply"
+OP_CONTEXT = "context"
+OP_CONTEXT_REPLY = "context_reply"
 
 ENV_HOST = "TAU_KERNEL_HOST"
 ENV_PORT = "TAU_KERNEL_PORT"
@@ -175,6 +177,30 @@ SubcallFn = Callable[[str, str | None], Awaitable[SubcallOutcome]]
 """Host-side completion the kernel can ask for, one prompt at a time."""
 
 
+class ContextSource(Protocol):
+    """Host-side supplier of addressed session-context handles.
+
+    A kernel asks for two things and receives only JSON: a bounded index of the
+    active context, and a **path** to a file holding the slice it named. Row
+    text travels through the file, never through a frame, which is what keeps a
+    200 KB history branch out of anybody's prompt. The kernel package stays
+    mechanism: it forwards these requests and never inspects a session type.
+
+    Reply contract (both keys optional except where noted):
+
+    * ``index`` -> ``{"rows": [...], "total": int, "omitted": int, ...}``
+    * ``open``  -> ``{"path": str, "written": int, "omitted": int, ...}``
+    """
+
+    async def index(self, query: str | None) -> Mapping[str, JSONValue]:
+        """Describe the active context in bounded rows; never its full text."""
+        ...
+
+    async def open(self, refs: tuple[str, ...]) -> Mapping[str, JSONValue]:
+        """Materialize the named entries as a file the kernel can read."""
+        ...
+
+
 class Kernel(Protocol):
     """The execution environment the code-mode tool needs.
 
@@ -260,6 +286,8 @@ __all__ = [
     "ENV_TOKEN",
     "HOST_DEFAULT",
     "OP_BIND",
+    "OP_CONTEXT",
+    "OP_CONTEXT_REPLY",
     "OP_DONE",
     "OP_EXEC",
     "OP_HELLO",
@@ -273,6 +301,7 @@ __all__ = [
     "OP_SUBCALL_BATCHED",
     "OP_SUBCALL_REPLY",
     "CellResult",
+    "ContextSource",
     "Kernel",
     "KernelError",
     "KernelLimits",

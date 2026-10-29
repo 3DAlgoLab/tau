@@ -54,6 +54,7 @@ from tau_coding.codex_model_store import (
 )
 from tau_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from tau_coding.context import discover_project_context_with_diagnostics
+from tau_coding.context_entries import ContextEntries
 from tau_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -838,6 +839,11 @@ class CodingSession:
             project_trust_resolution=trust_resolution,
         )
         session._code_mode = code_mode
+        if code_mode is not None:
+            # The context a cell searches is the context the *next* model call
+            # will see, so this is a live view of the active branch rather than
+            # a snapshot taken at construction.
+            code_mode.bind_context(ContextEntries(rows=session._active_context_rows))
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -2497,6 +2503,7 @@ class CodingSession:
                     model=lambda: self._harness.config.model,
                 )
             )
+            self._code_mode.bind_context(ContextEntries(rows=self._active_context_rows))
         return self._code_mode.tool()
 
     async def reload(self) -> CodingReloadSummary:
