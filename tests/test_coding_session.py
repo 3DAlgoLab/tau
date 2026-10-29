@@ -78,6 +78,7 @@ from tau_coding.extensions import (
 )
 from tau_coding.extensions.api import BeforeCompactEvent
 from tau_coding.extensions.runtime import CompactHookOutcome, InputHookOutcome
+from tau_coding.last_model import apply_last_model
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_config import ProviderModelMetadata, provider_thinking_levels
 from tau_coding.session import (
@@ -87,6 +88,7 @@ from tau_coding.session import (
     is_retryable_huggingface_route_error,
     parse_terminal_command,
 )
+from tau_coding.shell_config import LastModelPreference, load_shell_settings
 
 
 async def _collect_session_events(session_stream: object) -> list[object]:
@@ -7668,3 +7670,115 @@ async def test_dynamic_provider_rejects_unsupported_thinking_override(
         await CodingSession.load(
             _dynamic_thinking_override_config(tmp_path, thinking_level_override="max")
         )
+
+
+@pytest.mark.anyio
+async def test_an_in_session_model_switch_is_where_the_next_session_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A previewed picker switch must still move the pair a bare ``tau`` starts from.
+
+    ``/model`` previews a choice and the next accepted turn commits it with
+    ``persist_default=False``, because the *provider's* own default should not
+    move. The startup memory is a different thing, and suppressing it there left
+    a user who switched model and quit finding the model they had just rejected
+    waiting in the next session.
+    """
+    isolate_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    local = OpenAICompatibleProviderConfig(
+        name="local",
+        api_key_env="LOCAL_API_KEY",
+        credential_name=None,
+        models=("gpt", "qwen"),
+        default_model="gpt",
+    )
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    settings = ProviderSettings(default_provider="local", providers=(local,))
+    save_provider_settings(settings, paths=paths)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider([]),
+            model="gpt",
+            provider_name="local",
+            provider_settings=settings,
+            runtime_provider_config=local,
+            system="Test",
+            cwd=tmp_path,
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            extensions_enabled=False,
+        )
+    )
+    try:
+        session.preview_model_choice(ModelChoice("local", "qwen"))
+        await session._commit_preview()
+
+        assert session.model == "qwen"
+        assert load_shell_settings(paths).last_model == LastModelPreference(
+            provider_name="local", model="qwen"
+        )
+        # The split is the point: the starting pair moved, the provider's own
+        # catalog default deliberately did not.
+        assert load_provider_settings(paths).get_provider("local").default_model == "gpt"
+        # And a bare start with no flags resolves to the remembered pair.
+        assert apply_last_model(
+            load_provider_settings(paths),
+            load_shell_settings(paths),
+            provider_name=None,
+            model=None,
+        ) == ("local", "qwen")
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.anyio
+async def test_a_provider_switch_that_moves_no_default_still_moves_the_starting_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``/login`` switches provider without adopting a catalog default; memory follows."""
+    isolate_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    first = OpenAICompatibleProviderConfig(
+        name="first",
+        api_key_env="LOCAL_API_KEY",
+        credential_name=None,
+        models=("alpha",),
+        default_model="alpha",
+    )
+    second = OpenAICompatibleProviderConfig(
+        name="second",
+        api_key_env="LOCAL_API_KEY",
+        credential_name=None,
+        models=("beta",),
+        default_model="beta",
+    )
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    settings = ProviderSettings(default_provider="first", providers=(first, second))
+    save_provider_settings(settings, paths=paths)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider([]),
+            model="alpha",
+            provider_name="first",
+            provider_settings=settings,
+            runtime_provider_config=first,
+            system="Test",
+            cwd=tmp_path,
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            extensions_enabled=False,
+        )
+    )
+    try:
+        session.set_provider("second", persist_default=False)
+
+        assert load_shell_settings(paths).last_model == LastModelPreference(
+            provider_name="second", model="beta"
+        )
+        # ``persist_default=False`` is the part that protects the catalog: neither
+        # the default provider nor either provider's default model moved.
+        saved = load_provider_settings(paths)
+        assert saved.default_provider == "first"
+        assert saved.get_provider("first").default_model == "alpha"
+        assert saved.get_provider("second").default_model == "beta"
+    finally:
+        await session.aclose()

@@ -66,6 +66,24 @@ provider default_model      unchanged behaviour
   always ignored them, so a settings.json written by a newer Tau used to lose
   its own keys the first time an older Tau wrote a flag into the same file.
 
+## Two memories, two switches
+
+`persist_default` gates the catalog, not the memory. `select_provider_model` and
+`_set_provider_model` used to write `default_model` **and** `lastModel` inside
+the same `if persist_default:` block, so the two callers that pass
+`persist_default=False` — `_commit_preview()` (a `/model` picker choice committed
+on the next accepted turn) and the `/login` provider switch — moved the session
+onto a new pair and recorded nothing. The next bare `tau` then started on the
+pair the user had just rejected, which is the one behaviour `lastModel` exists to
+prevent.
+
+Now `_persist_last_model_choice()` runs on every settled selection. The catalog
+default stays under `persist_default`, because an account-scoped or temporary
+choice must not silently become what `tau providers list` calls the default; the
+startup memory follows whatever the session actually settled on. The memory write
+no longer depends on `selected_config` either — a dynamic provider's account-only
+model has no durable config to write, and it is still what the user chose.
+
 ## `/new` keeps the pair
 
 `CodingSession.new_session()` used to call `resolve_provider_selection(settings)`

@@ -1954,7 +1954,12 @@ class CodingSession:
                 await self._close_replaced_provider(old_provider)
         if selected_config is not None and persist_default:
             self._persist_default_model_choice()
-            self._persist_last_model_choice()
+        # Two different memories, and only one of them is the catalog. A previewed
+        # picker choice commits with ``persist_default=False`` precisely so it does
+        # not rewrite a provider's own default; the pair the next bare ``tau``
+        # starts from is still this one, and an account-only model has no durable
+        # config to write but is still what the user just chose.
+        self._persist_last_model_choice()
         return ModelSelectionResult(choice, changed=True)
 
     def set_inference_provider(self, route: str | None) -> str:
@@ -2210,7 +2215,9 @@ class CodingSession:
         self._sync_image_support()
         if persist_default:
             self._persist_default_model_choice()
-            self._persist_last_model_choice()
+        # See ``select_provider_model``: the startup memory tracks what the session
+        # settled on even when the catalog default deliberately stays put.
+        self._persist_last_model_choice()
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
