@@ -144,6 +144,14 @@ model decided matters comes back. Inside a cell:
 - `attach({"name": "path"})` on the tool call binds a file the cell can `open()`;
   the file's bytes never enter the prompt. Handles belong to the namespace, so a
   cell after a kernel kill must restate them.
+- `rlm_query(task, model=None)` and `rlm_query_batched(tasks, model=None)` hand a
+  **task** to a child that solves it by writing code: a fresh kernel, up to three
+  cells in which it sees what its own code printed, then an answer through `ret(...)`
+  or one plain-text reply when the turns run out. Every child turn is a call on the
+  same per-cell sub-call budget, and the child cannot itself recurse for real -- past
+  the depth ceiling a recursion is answered by one plain completion, which the result
+  metadata says out loud. Off unless `"codeModeRecursion": true` is set in
+  `~/.tau/settings.json`; when off, these names do not exist in the namespace.
 - `context_index()` and `context_open(refs)` read the **session's own history** from
   inside the cell. The index describes the active context in bounded rows carrying
   the same `(#N)` addresses a compaction summary cites; `context_open("#8-#19")`, or
@@ -157,7 +165,9 @@ The kernel is a separate Python process with no provider credentials in its
 environment and byte-bounded output. That boundary keeps model-written code from
 reaching harness objects or secrets; it is not a defence against hostile code.
 Set `"codeMode": false` in `~/.tau/settings.json` to start every session without
-this tool. A host that supplies its own `tools` list never receives it
+this tool, and `"codeModeRecursion": true` to add the recursion names described
+above (default off, because a recursion starts another process and spends a turn
+budget on it). A host that supplies its own `tools` list never receives it
 automatically, and `allowed_tool_names` can drop it like any other tool.
 
 ## Choosing the right tool

@@ -101,6 +101,7 @@ cell, because one unreachable prompt must not destroy the work of the others.
 | ``max_concurrent_subcalls`` | ``_bounded`` under one semaphore |
 | ``custom_tools`` as code strings, callables cannot cross | only JSON crosses; bindings live in the child |
 | ``context_N`` payload | ``bind(name, path)`` -- a handle, not a payload (Phase 2c extends it) |
+| ``rlm_query`` among the injected globals | an opt-in ``rlm`` frame served by ``RlmQuery`` off a depth guard, absent unless the session asks (Phase 2c-iii) |
 
 Upstream injects its bindings as *generated source* because its kernel is a
 foreign process it does not own. We own the child, so the bindings are ordinary
@@ -124,7 +125,8 @@ cheap most of the time.
 - No ``tau_ai`` dependency: the host is handed a ``SubcallFn``. Phase 2b binds it
   to a provider call, and the same primitives then serve a non-recursive fan-out
   (code review) without ever naming RLM.
-- No depth guard yet: recursion needs ``rlm_query``, which is Phase 2c.
+- No depth guard: recursion is not this phase's problem. It arrives as
+  ``rlm_query`` in Phase 2c-iii.
 - No context-as-variable handle beyond a bound path.
 - No Windows claim: framing and the socket are portable, resource limits are not.
 

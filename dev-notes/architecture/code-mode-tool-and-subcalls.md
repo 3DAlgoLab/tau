@@ -56,10 +56,12 @@ not the values. `/model` and `reload_plugins` rebuild the harness; a kernel that
 outlives that switch must ask its question of the model the session is using now,
 not the one that was current when the kernel started.
 
-**A sub-call is a leaf.** The request carries `tools=[]`, so recursion is
-structurally impossible until an explicit `rlm_query` arrives with a depth guard.
-Without that, one cell could start an agent that starts a kernel that starts an
-agent, with nothing counting.
+**A sub-call is a leaf.** The request carries `tools=[]`, so a sub-call cannot
+start an agent. Recursion exists as of Phase 2c-iii, but it is a *different*
+handler on a different frame (`rlm` / `rlm_batched`) with its own depth guard and
+its own accounting; a sub-call still cannot reach it. Without that separation, one
+cell could start an agent that starts a kernel that starts an agent, with nothing
+counting.
 
 **Every sub-call is tallied.** Sub-calls are not session messages, so session usage
 analytics cannot see them; the ledger in `SubcallTotals` is what keeps their cost
@@ -75,9 +77,10 @@ default 4) so a batch cannot open an unbounded number of streams. `begin_cell`
 hands the bridge the tool's cancellation token: a cell the user stops stops paying
 for in-flight requests rather than merely stopping to read their answers.
 
-There is deliberately no `rlm_query` yet. That name arrives in Phase 2c with a
-depth guard, and until then the only recursion is the model calling itself once
-per line of code it wrote.
+`rlm_query` / `rlm_query_batched` exist as of Phase 2c-iii and are opt-in; see
+[Recursion Inside python_repl](./code-mode-recursion.md) for the guard, the turn
+budget, and why the depth default makes a child's own `rlm_query` a plain
+completion.
 
 ## Lifetime: one kernel per conversation
 
@@ -162,7 +165,6 @@ seam) can later answer the same call with a real interrupt and keep state.
 
 - `bind()`, the file-handle path into the namespace, is on `ProcessKernel` but not
   exposed through the tool. That is Phase 2c's context-as-variable work.
-- No `rlm_query`, no depth guard, no recursion.
 - No TUI surface for code mode: no state panel, no per-session toggle.
 - No per-conversation namespace isolation beyond "one kernel per session"; two
   branches of the same session share one kernel.
@@ -176,7 +178,7 @@ responses with the omission reported, empty answers flagged rather than trusted,
 the per-cell budget (including failures against it), and the ledger resetting at
 the cell boundary.
 
-`tests/test_code_mode.py` (22) drives the tool through `AgentTool.execute` against
+`tests/test_code_mode.py` (36) drives the tool through `AgentTool.execute` against
 a real child process: namespace persistence, `ret()` as data and the reason a
 non-data `ret()` was refused, a raising cell that does not end the kernel,
 `SHOW_VARS` listing names without values, the output-cap note, overrun with
@@ -187,16 +189,18 @@ the default path, an explicit tool list, `code_mode_enabled=False`, the allow
 list, `/reload` keeping the same namespace, `aclose` closing the kernel, and a new
 session closing the old kernel.
 
-`tests/test_shell_config.py` (+7) covers `codeMode`: default on, both spellings
-refused together, a non-boolean refused rather than read as truthy, and
-round-trip with a shell prefix present.
+`tests/test_shell_config.py` covers `codeMode` (default on, both spellings refused
+together, a non-boolean refused rather than read as truthy, round-trip with a shell
+prefix) and `codeModeRecursion` (default off, opt-in round-trip, non-boolean
+refused, and nonsense-but-harmless while code mode is off).
 
 Dev work runs from this checkout: `uv run tau ...` inside `tau-dev`, or a global
 `uv tool install --editable .`. `TAU_HOME` is the one knob for moving a home.
 
 ## Next
 
-Phase 2c replaces raw payloads with addressed handles: session-log entries exposed
-to the kernel as bounded, sliceable references, so "read this 200 KB branch" is a
-handle the kernel opens rather than a string pasted into a prompt. Phase 2d ports
-the `fabric-rlm` skill on top of that, with `rlm_query` carrying the depth guard.
+What this note planned as Phase 2c shipped, in three parts, each with its own note
+beside this one: file handles as paths (2c-i), session history over addressed JSONL
+slices (2c-ii), and recursion behind a depth guard (2c-iii). What is left on this
+track is the evaluation and code-review harness, which is where the evidence that
+any of it is worth its cost has to come from.

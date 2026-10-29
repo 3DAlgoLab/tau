@@ -74,6 +74,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [Code Mode As A Session Tool (Phase 2b)](./code-mode-tool-and-subcalls.md)
 - [File Handles In The Kernel (Phase 2c-i)](./code-mode-file-handles.md)
 - [Session History Handles In The Kernel (Phase 2c-ii)](./code-mode-context-handles.md)
+- [Recursion Inside python_repl (Phase 2c-iii)](./code-mode-recursion.md)
 
 Phase 21 extensions are implemented; see the phase note and the user guide at
 `website/content/guides/extensions.md`.

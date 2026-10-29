@@ -31,6 +31,15 @@ class ShellSettings:
     gains ``python_repl`` automatically.
     """
 
+    code_mode_recursion: bool = False
+    """Whether ``python_repl`` also binds ``rlm_query`` / ``rlm_query_batched``.
+
+    Off by default, because a recursion is not a cheaper model call: it starts a
+    kernel of its own and spends a turn budget on it. Whether that is worth
+    allowing on this machine is the user's cost decision; the ceilings themselves
+    belong to :class:`~tau_coding.rlm.RlmLimits` and are not set here.
+    """
+
     def to_json(self) -> dict[str, object]:
         """Serialize these settings to JSON-compatible data."""
         result: dict[str, object] = {}
@@ -40,6 +49,8 @@ class ShellSettings:
             result["shellCommandPrefix"] = self.shell_command_prefix
         if not self.code_mode:
             result["codeMode"] = False
+        if self.code_mode_recursion:
+            result["codeModeRecursion"] = True
         return result
 
 
@@ -70,6 +81,8 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
         raise ShellConfigError("Use only one of shellCommandPrefix or shell_command_prefix")
     if "codeMode" in data and "code_mode" in data:
         raise ShellConfigError("Use only one of codeMode or code_mode")
+    if "codeModeRecursion" in data and "code_mode_recursion" in data:
+        raise ShellConfigError("Use only one of codeModeRecursion or code_mode_recursion")
 
     raw_default = data.get("defaultProjectTrust", "ask")
     if raw_default not in {"ask", "always", "never"}:
@@ -82,9 +95,20 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
     if not isinstance(raw_code_mode, bool):
         raise ShellConfigError("codeMode must be a boolean")
 
+    # Recursion is opt-in in both directions: a non-boolean is refused rather
+    # than read as truthy, since "true" as a string would silently enable a
+    # feature that starts extra processes.
+    raw_recursion = data.get("codeModeRecursion", data.get("code_mode_recursion", False))
+    if not isinstance(raw_recursion, bool):
+        raise ShellConfigError("codeModeRecursion must be a boolean")
+
     raw_prefix = data.get("shellCommandPrefix", data.get("shell_command_prefix"))
     if raw_prefix is None:
-        return ShellSettings(default_project_trust=raw_default, code_mode=raw_code_mode)
+        return ShellSettings(
+            default_project_trust=raw_default,
+            code_mode=raw_code_mode,
+            code_mode_recursion=raw_recursion,
+        )
     if not isinstance(raw_prefix, str):
         raise ShellConfigError("shellCommandPrefix must be a string")
     prefix = raw_prefix.strip()
@@ -92,4 +116,5 @@ def shell_settings_from_json(data: dict[str, Any]) -> ShellSettings:
         shell_command_prefix=prefix or None,
         default_project_trust=raw_default,
         code_mode=raw_code_mode,
+        code_mode_recursion=raw_recursion,
     )

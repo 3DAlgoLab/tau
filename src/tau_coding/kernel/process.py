@@ -45,6 +45,9 @@ from tau_coding.kernel.protocol import (
     OP_OUT,
     OP_READY,
     OP_RESET,
+    OP_RLM,
+    OP_RLM_BATCHED,
+    OP_RLM_REPLY,
     OP_SHUTDOWN,
     OP_STARTUP,
     OP_STATE,
@@ -59,13 +62,23 @@ from tau_coding.kernel.protocol import (
     KernelState,
     KernelUnavailableError,
     KernelVar,
+    RlmFn,
     SubcallFn,
     SubcallOutcome,
     bounded_text,
 )
-from tau_coding.kernel.scaffold import BINDINGS
+from tau_coding.kernel.scaffold import BINDINGS, RECURSION_BINDINGS
 
 DEFAULT_CELL_TIMEOUT_SECONDS = 30.0
+
+DEFAULT_MAX_CONCURRENT_RLMS = 2
+
+"""Children running at once for one kernel.
+
+A sub-call is a request; a recursion is a process and a turn budget, so it is
+bounded more tightly than the sub-call fan-out even though both cross the same
+channel.
+"""
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 20.0
 CONTROL_TIMEOUT_SECONDS = 5.0
 DEFAULT_CELL_OUTPUT_BYTES = 64 * 1024
@@ -213,7 +226,9 @@ class ProcessKernel:
         cwd: Path,
         subcall: SubcallFn | None = None,
         context: ContextSource | None = None,
+        rlm: RlmFn | None = None,
         max_concurrent_subcalls: int = 4,
+        max_concurrent_rlms: int = DEFAULT_MAX_CONCURRENT_RLMS,
         cell_timeout_seconds: float = DEFAULT_CELL_TIMEOUT_SECONDS,
         startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
         limits: KernelLimits | None = None,
@@ -224,7 +239,9 @@ class ProcessKernel:
         self._cwd = cwd
         self._subcall = subcall
         self._context = context
+        self._rlm = rlm
         self._max_concurrent_subcalls = max(1, max_concurrent_subcalls)
+        self._max_concurrent_rlms = max(1, max_concurrent_rlms)
         self._cell_timeout = cell_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._limits = limits or KernelLimits()
@@ -245,11 +262,13 @@ class ProcessKernel:
         self._pending: dict[str, _CellBuffer] = {}
         self._cell_lock = asyncio.Lock()
         self._subcall_semaphore = asyncio.Semaphore(self._max_concurrent_subcalls)
+        self._rlm_semaphore = asyncio.Semaphore(self._max_concurrent_rlms)
         self._alive = False
         self._closing = False
         self._closed = False
         self._cells_run = 0
         self._subcalls_used = 0
+        self._recursions_used = 0
         self._context_reads = 0
         self._restarts = 0
         self._ever_started = False
@@ -271,6 +290,18 @@ class ProcessKernel:
     def context_reads(self) -> int:
         """Context index and slice requests served for this kernel."""
         return self._context_reads
+
+    @property
+    def recursions_used(self) -> int:
+        """Recursions served for this kernel, counting ones that fell back."""
+        return self._recursions_used
+
+    @property
+    def binding_names(self) -> tuple[str, ...]:
+        """The names this kernel will bind, reported to the child at startup."""
+        if self._rlm is None:
+            return tuple(name for name in BINDINGS if name not in RECURSION_BINDINGS)
+        return BINDINGS
 
     @property
     def cells_run(self) -> int:
@@ -309,6 +340,19 @@ class ProcessKernel:
     def dead_reason(self) -> str | None:
         """Why the kernel last stopped, if it has."""
         return self._dead_reason
+
+    @property
+    def _reported_bindings(self) -> tuple[str, ...]:
+        """What the child says it bound, falling back to what we asked for.
+
+        The snapshot is a claim about the namespace, so it carries the child's
+        answer rather than the host's request: if the two disagree, the
+        discrepancy is the bug worth seeing.
+        """
+        raw = self._ready_info.get("bindings")
+        if isinstance(raw, list):
+            return tuple(str(name) for name in raw)
+        return self.binding_names
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -494,7 +538,7 @@ class ProcessKernel:
             subcalls_used=self._subcalls_used,
             restarts=self._restarts,
             variables=variables,
-            bindings=BINDINGS,
+            bindings=self._reported_bindings,
             note=note if note is not None else self._dead_reason,
         )
 
@@ -524,6 +568,7 @@ class ProcessKernel:
                     "op": OP_STARTUP,
                     "limits": self._limits.to_json(),
                     "max_cell_output_bytes": self._max_cell_output_bytes,
+                    "bindings": list(self.binding_names),
                 },
             )
         except FrameError as exc:
@@ -564,6 +609,16 @@ class ProcessKernel:
                     )
                 except FrameError as exc:
                     await self._stop(f"the sub-call reply never reached the kernel: {exc}")
+                    return
+            elif op in (OP_RLM, OP_RLM_BATCHED):
+                reply = await self._serve_recursion(frame)
+                try:
+                    await write_frame(
+                        writer,
+                        {"op": OP_RLM_REPLY, "req_id": frame.get("req_id", ""), **reply},
+                    )
+                except FrameError as exc:
+                    await self._stop(f"the recursion reply never reached the kernel: {exc}")
                     return
             elif op == OP_CONTEXT:
                 reply = await self._serve_context(frame)
@@ -642,6 +697,54 @@ class ProcessKernel:
             reply["omitted"] = int(reply.get("omitted", 0)) + dropped
             reply["note"] = f"index trimmed by {dropped} rows to fit the frame limit"
         return reply
+
+    async def _serve_recursion(self, frame: Mapping[str, Any]) -> dict[str, Any]:
+        """Answer a recursion request from inside a cell.
+
+        The kernel cannot tell a recursion from a sub-call and is not asked to:
+        the whole policy -- depth, turns, which kernel the child gets -- lives on
+        the host side. What this layer guarantees is only that a recursion is
+        concurrency-bounded and that a failure comes back as a reply rather than
+        as a lost cell.
+        """
+        if self._closing:
+            return {"error": "the kernel channel is closing"}
+        if self._rlm is None:
+            return {"error": "no recursion handler is wired, so this kernel cannot recurse"}
+        raw_model = frame.get("model")
+        model = raw_model if isinstance(raw_model, str) else None
+        if frame.get("op") == OP_RLM:
+            task = str(frame.get("task", ""))
+            self._recursions_used += 1
+            try:
+                outcome = await self._bounded_rlm(task, model)
+            except Exception as exc:  # the cell must see a failure, not lose its kernel
+                return {"error": f"recursion failed: {type(exc).__name__}: {exc}"}
+            return dict(outcome.to_frame())
+        raw_tasks = frame.get("tasks")
+        tasks = [str(item) for item in raw_tasks] if isinstance(raw_tasks, list) else []
+        self._recursions_used += len(tasks)
+        results = await asyncio.gather(
+            *(self._bounded_rlm(task, model) for task in tasks), return_exceptions=True
+        )
+        responses: list[str | None] = []
+        failures: list[str] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                responses.append(None)
+                failures.append(f"{type(result).__name__}: {result}")
+            else:
+                responses.append(result.text)
+        reply: dict[str, Any] = {"responses": responses}
+        if failures:
+            reply["errors"] = failures
+        return reply
+
+    async def _bounded_rlm(self, task: str, model: str | None) -> SubcallOutcome:
+        if self._rlm is None:
+            raise KernelError("no recursion handler is wired")
+        async with self._rlm_semaphore:
+            return await self._rlm(task, model)
 
     async def _serve_subcall(self, frame: Mapping[str, Any]) -> dict[str, Any]:
         """Serve one sub-call request from inside a cell."""

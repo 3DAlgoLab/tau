@@ -88,6 +88,7 @@ from tau_coding.extensions.api import BeforeCompactEvent, CompactionContextEntry
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
 from tau_coding.extensions.runtime import CompactHookOutcome, ExtensionRuntime
+from tau_coding.kernel.process import ProcessKernel
 from tau_coding.kernel.subcall import SubcallBridge
 from tau_coding.models_dev_store import ModelsDevRefreshResult, refresh_models_dev_catalog
 from tau_coding.oauth import account_id_from_access_token
@@ -143,6 +144,7 @@ from tau_coding.resources import (
     resource_paths_with_cwd,
     resource_paths_with_project_trust,
 )
+from tau_coding.rlm import DEFAULT_CHILD_CELL_TIMEOUT_SECONDS, RlmLimits, RlmQuery
 from tau_coding.session_export import (
     default_session_export_artifact_path,
     export_session_artifact,
@@ -232,6 +234,47 @@ async def _finish_adopted_code_mode_close(code_mode: CodeMode | None) -> None:
     await _await_cleanup_completion(task)
     with suppress(BaseException):
         task.result()
+
+
+def _wire_code_mode_recursion(
+    code_mode: CodeMode,
+    bridge: SubcallBridge,
+    *,
+    cwd: Path,
+    max_depth: int,
+    max_turns: int = 3,
+    max_children_per_cell: int = 4,
+) -> None:
+    """Give a session's code mode the recursion bindings.
+
+    The child kernel is constructed here rather than inside code mode because a
+    child answers through the *same* bridge as the parent's sub-calls -- that is
+    what makes its turns show up in one ledger -- and only the session can supply
+    a bridge that resolves the live provider and model. The ceilings travel with
+    :class:`~tau_coding.rlm.RlmLimits`, so the recursion policy has one owner and
+    the kernel layer stays a transport.
+    """
+    code_mode.bind_recursion(
+        RlmQuery(
+            bridge=bridge,
+            kernel_factory=lambda rlm: ProcessKernel(
+                cwd=cwd,
+                subcall=bridge,
+                rlm=rlm,
+                # A child works one task on one thread; anything wider would be
+                # the child racing itself for its own namespace.
+                max_concurrent_subcalls=1,
+                # The recursion enforces the per-turn budget; this is the backstop
+                # for a child cell that ignores it.
+                cell_timeout_seconds=DEFAULT_CHILD_CELL_TIMEOUT_SECONDS + 5.0,
+            ),
+            limits=RlmLimits(
+                max_depth=max_depth,
+                max_turns=max_turns,
+                max_children_per_cell=max_children_per_cell,
+            ),
+        )
+    )
 
 
 async def _finish_aborted_session_close(session: CodingSession) -> None:
@@ -405,6 +448,17 @@ class CodingSessionConfig:
     index_on_first_persist: bool = False
     shell_command_prefix: str | None = None
     code_mode_enabled: bool = True
+    code_mode_recursion_enabled: bool = False
+    """Whether code mode also binds ``rlm_query`` / ``rlm_query_batched``.
+
+    Off by default: a recursion starts a kernel and spends a turn budget, so it is
+    a cost decision rather than a capability one. When on, ``rlm_query(task)`` in
+    a cell hands the task to a child with its own kernel and turns, bounded by
+    :class:`~tau_coding.rlm.RlmLimits` and accounted in the parent cell's sub-call
+    ledger. See :mod:`tau_coding.rlm`.
+    """
+    code_mode_rlm_max_depth: int = 1
+    """How deep recursions may nest; 1 means children cannot recurse for real."""
     """Whether the default tool set includes the code-mode ``python_repl`` tool.
 
     Code mode runs model-written Python in a persistent kernel process; see
@@ -760,7 +814,10 @@ class CodingSession:
         code_mode = (
             None
             if config.tools is not None or not config.code_mode_enabled
-            else CodeMode(cwd=config.cwd)
+            else CodeMode(
+                cwd=config.cwd,
+                recursion_enabled=config.code_mode_recursion_enabled,
+            )
         )
         if code_mode is not None:
             base_tools = [*base_tools, code_mode.tool()]
@@ -810,12 +867,18 @@ class CodingSession:
             # through the harness config object the session mutates in place on
             # ``/model`` and provider selection. A kernel created before a model
             # change therefore asks the *current* model, not the startup one.
-            code_mode.bind_subcall(
-                SubcallBridge(
-                    provider=lambda: harness.config.provider,
-                    model=lambda: harness.config.model,
-                )
+            bridge = SubcallBridge(
+                provider=lambda: harness.config.provider,
+                model=lambda: harness.config.model,
             )
+            code_mode.bind_subcall(bridge)
+            if config.code_mode_recursion_enabled:
+                _wire_code_mode_recursion(
+                    code_mode,
+                    bridge,
+                    cwd=config.cwd,
+                    max_depth=config.code_mode_rlm_max_depth,
+                )
         if previous_runtime is not None:
             extension_runtime.set_ui_bridge(previous_runtime.ui)
         session = cls(
@@ -2496,13 +2559,22 @@ class CodingSession:
         if self._config.tools is not None or not self._config.code_mode_enabled:
             return None
         if self._code_mode is None:
-            self._code_mode = CodeMode(cwd=self._config.cwd)
-            self._code_mode.bind_subcall(
-                SubcallBridge(
-                    provider=lambda: self._harness.config.provider,
-                    model=lambda: self._harness.config.model,
-                )
+            self._code_mode = CodeMode(
+                cwd=self._config.cwd,
+                recursion_enabled=self._config.code_mode_recursion_enabled,
             )
+            bridge = SubcallBridge(
+                provider=lambda: self._harness.config.provider,
+                model=lambda: self._harness.config.model,
+            )
+            self._code_mode.bind_subcall(bridge)
+            if self._config.code_mode_recursion_enabled:
+                _wire_code_mode_recursion(
+                    self._code_mode,
+                    bridge,
+                    cwd=self._config.cwd,
+                    max_depth=self._config.code_mode_rlm_max_depth,
+                )
             self._code_mode.bind_context(ContextEntries(rows=self._active_context_rows))
         return self._code_mode.tool()
 
@@ -2944,6 +3016,8 @@ class CodingSession:
                 thinking_level=self._thinking_level,
                 shell_command_prefix=self._config.shell_command_prefix,
                 code_mode_enabled=self._config.code_mode_enabled,
+                code_mode_recursion_enabled=self._config.code_mode_recursion_enabled,
+                code_mode_rlm_max_depth=self._config.code_mode_rlm_max_depth,
                 skills_enabled=self._config.skills_enabled,
                 allowed_tool_names=self._config.allowed_tool_names,
                 extension_paths=self._config.extension_paths,

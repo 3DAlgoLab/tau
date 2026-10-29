@@ -18,7 +18,7 @@ import pytest
 from pi_event_helpers import assistant_done, assistant_start, text_delta
 from tau_agent.harness import SimpleCancellationToken
 from tau_agent.messages import AssistantMessage, UserMessage
-from tau_agent.session import JsonlSessionStorage
+from tau_agent.session import JsonlSessionStorage, ModelChangeEntry, SessionInfoEntry
 from tau_agent.tools import AgentToolResult, ToolCancellationToken
 from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
@@ -29,8 +29,11 @@ from tau_coding.code_mode import (
     CodeMode,
 )
 from tau_coding.context_entries import ContextEntries
+from tau_coding.kernel.protocol import SubcallOutcome
 from tau_coding.kernel.scaffold import RESERVED
 from tau_coding.kernel.subcall import SubcallBridge
+from tau_coding.paths import TauPaths
+from tau_coding.rlm import RlmTotals
 from tau_coding.session import CodingSession, CodingSessionConfig
 from tau_coding.session_manager import SessionManager
 from tau_coding.tools import ToolInputError
@@ -389,11 +392,103 @@ async def test_python_repl_is_part_of_the_default_tool_set(tmp_path: Path) -> No
         await session.aclose()
 
 
+async def test_recursion_survives_a_resume(tmp_path: Path) -> None:
+    # A resumed session builds its own config from the source session's, so a
+    # capability the settings promised must travel through that rebuild rather
+    # than silently come back unbound.
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    manager = SessionManager(paths)
+    record = manager.create_session(cwd=tmp_path, model="fake", title="recurse")
+    storage = JsonlSessionStorage(record.path)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider([]),  # type: ignore[arg-type]
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            session_id=record.id,
+            session_manager=manager,
+            cwd=tmp_path,
+            code_mode_recursion_enabled=True,
+        )
+    )
+    try:
+        assert session.code_mode is not None
+        assert session.code_mode.recursion is not None
+        await storage.append(SessionInfoEntry(cwd=str(tmp_path)))
+        await storage.append(ModelChangeEntry(model="fake"))
+        await session.resume(record.id)
+        assert session.code_mode is not None
+        assert session.code_mode.recursion is not None
+    finally:
+        await session.aclose()
+
+
 async def test_an_explicit_tool_set_owns_its_tools(tmp_path: Path) -> None:
     session = await CodingSession.load(_session_config(tmp_path, tools=[]))
     try:
         assert PYTHON_REPL_TOOL_NAME not in {tool.name for tool in session.tools}
         assert session.code_mode is None
+    finally:
+        await session.aclose()
+
+
+class _StubRecursion:
+    """A recursion runner that only reports: the policy has its own test file.
+
+    What is pinned here is that code mode routes a recursion and says what it
+    cost, without pretending to be the thing that decides how deep one may go.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: list[str] = []
+
+    def begin_cell(self, signal: ToolCancellationToken | None = None) -> None:
+        pass
+
+    def take_totals(self) -> RlmTotals:
+        return RlmTotals(children=1, fallbacks=1, turns=3, cells=2, deepest=1)
+
+    async def __call__(self, task: str, model: str | None = None) -> SubcallOutcome:
+        self.tasks.append(task)
+        return SubcallOutcome(text="42", model="fake", metadata={})
+
+
+async def test_a_wired_recursion_answers_and_is_reported(tmp_path: Path) -> None:
+    recursion = _StubRecursion()
+    async with _mode(cwd=tmp_path, recursion_enabled=True) as mode:
+        mode.bind_recursion(recursion)
+        result = await _cell(mode, 'ret({"answer": rlm_query("count the rows")})')
+        assert recursion.tasks == ["count the rows"]
+        assert "1 recursion: 3 turns, 2 child cells, depth 1" in _text(result)
+        assert "answered directly at the depth ceiling" in _text(result)
+        assert result.details["recursion"]["children"] == 1
+
+
+def test_recursion_names_are_advertised_only_when_wired(tmp_path: Path) -> None:
+    assert "rlm_query" not in CodeMode(cwd=tmp_path).tool().description
+    wired = CodeMode(cwd=tmp_path, recursion_enabled=True)
+    wired.bind_recursion(_StubRecursion())
+    assert "rlm_query" in wired.tool().description
+    assert any("rlm_query" in line for line in wired.tool().prompt_guidelines)
+
+
+async def test_recursion_is_off_until_a_session_asks(tmp_path: Path) -> None:
+    session = await CodingSession.load(_session_config(tmp_path))
+    try:
+        assert session.code_mode is not None
+        assert session.code_mode.recursion is None
+    finally:
+        await session.aclose()
+
+
+async def test_a_session_can_ask_for_recursion(tmp_path: Path) -> None:
+    session = await CodingSession.load(_session_config(tmp_path, code_mode_recursion_enabled=True))
+    try:
+        assert session.code_mode is not None
+        assert session.code_mode.recursion is not None
+        repl = [tool for tool in session.tools if tool.name == PYTHON_REPL_TOOL_NAME]
+        assert "rlm_query" in repl[0].description
     finally:
         await session.aclose()
 

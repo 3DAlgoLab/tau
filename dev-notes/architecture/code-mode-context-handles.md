@@ -66,6 +66,12 @@ when it starts.
 
 No summarization, no retrieval ranking, no prose classifier. The cell decides what
 matters after it can grep the file; the host's only job is to describe the context
-honestly and stay inside its ceilings. Recursive `rlm_query` with a depth guard is
-the next layer, and it should reuse these handles rather than inventing another way
-to name history.
+honestly and stay inside its ceilings.
+
+
+The recursion layer that followed (Phase 2c-iii) kept this rule instead of inventing
+another way to name history: a child kernel is not given the session's
+`context_index`, and history travels down as a **path** the parent materialized
+with `context_open` and named in the task. Same cwd, same scratch directory, so the
+child can open it; nothing is copied, and the child pays only for the slice it
+reads. See [Recursion Inside python_repl](./code-mode-recursion.md).

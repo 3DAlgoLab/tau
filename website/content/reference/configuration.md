@@ -81,6 +81,15 @@ running at all. The value is user-global, like trust: a project cannot enable or
 disable it. One-shot hosts that build their own tool list never gain the tool
 automatically.
 
+
+`settings.json` may also contain `"codeModeRecursion": true | false` (default
+`false`). It adds `rlm_query` / `rlm_query_batched` to the code-mode namespace: a
+recursion hands a task to a child with a kernel of its own, bounded by a turn
+budget and a depth ceiling, and every child turn is counted in the parent cell's
+sub-call budget. Off by default because it is a cost decision rather than a
+capability one -- a recursion starts another process -- and the ceilings are
+Tau's, not settings.
+
 Startup update checks cache their latest PyPI result in
 `~/.tau/cache/update-check.json` and refresh at most once per day. A failed
 check (for example while offline) is retried after an hour. Set

@@ -387,6 +387,71 @@ async def test_limits_are_enforced_inside_the_child(tmp_path: Path) -> None:
         assert kernel.limits_notes == ()
 
 
+class _FakeRecursion:
+    """A stand-in for the host-side recursion runner the code-mode tool injects.
+
+    The transport is what is under test here: a recursion request must travel the
+    same channel as a sub-call, and a failure inside one must not take the kernel
+    with it.
+    """
+
+    def __init__(self, failures: tuple[str, ...] = ()) -> None:
+        self.tasks: list[tuple[str, str | None]] = []
+        self.failures = failures
+
+    async def __call__(self, task: str, model: str | None = None) -> SubcallOutcome:
+        self.tasks.append((task, model))
+        if task in self.failures:
+            raise RuntimeError(f"no child for {task!r}")
+        return SubcallOutcome(text=f"<<{task}>>", model=model or "fake", metadata={"rlm_depth": 1})
+
+
+async def test_recursion_names_exist_only_when_a_handler_is_wired(tmp_path: Path) -> None:
+    async with _running(tmp_path) as unwired:
+        assert "rlm_query" not in unwired.binding_names
+        result = await unwired.execute("print(rlm_query('do the thing'))")
+        assert not result.ok
+        assert "NameError" in (result.error or "")
+
+    async with _running(tmp_path, rlm=_FakeRecursion()) as wired:
+        state = await wired.state()
+        assert "rlm_query" in state.bindings
+        assert "rlm_query_batched" in state.bindings
+        answered = await wired.execute("print(rlm_query('do the thing'))")
+        assert answered.ok, answered.error
+        assert answered.stdout == "<<do the thing>>\n"
+        assert wired.recursions_used == 1
+
+
+async def test_a_recursion_failure_costs_the_call_not_the_kernel(tmp_path: Path) -> None:
+    recursion = _FakeRecursion(failures=("impossible",))
+    async with _running(tmp_path, rlm=recursion) as kernel:
+        failed = await kernel.execute("print(rlm_query('impossible'))")
+        assert not failed.ok
+        assert "recursion failed" in (failed.error or "")
+        assert kernel.alive
+        survivor = await kernel.execute("print('still here')")
+        assert survivor.ok
+
+
+async def test_a_batch_of_recursions_keeps_its_slots(tmp_path: Path) -> None:
+    recursion = _FakeRecursion(failures=("bad",))
+    async with _running(tmp_path, rlm=recursion) as kernel:
+        result = await kernel.execute("print(rlm_query_batched(['good', 'bad']))")
+        assert result.ok, result.error
+        assert result.stdout == "['<<good>>', None]\n"
+        assert kernel.recursions_used == 2
+
+
+async def test_recursion_and_subcalls_share_one_channel(tmp_path: Path) -> None:
+    async with _running(tmp_path, subcall=_FakeSubcall(), rlm=_FakeRecursion()) as kernel:
+        mixed = await kernel.execute("print(llm_query('ask'), rlm_query('delegate'))")
+        assert mixed.ok, mixed.error
+        assert mixed.stdout == "<<ask>> <<delegate>>\n"
+        assert kernel.subcalls_used == 1
+        assert kernel.recursions_used == 1
+
+
 async def test_close_releases_the_process(tmp_path: Path) -> None:
     kernel = ProcessKernel(cwd=tmp_path)
     await kernel.start()

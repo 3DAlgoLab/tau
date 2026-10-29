@@ -16,6 +16,10 @@ Two properties are load-bearing:
 * Every sub-call is **tallied**. Sub-calls are invisible to session usage
   analytics because they are not session messages; the ledger here is what keeps
   their cost from vanishing.
+* A **system prompt can be supplied per call**, because the recursion layer
+  drives the same provider path with a different job (ask for code, not for an
+  answer) and must not escape the ceiling or the ledger by carrying its own
+  client.
 """
 
 from __future__ import annotations
@@ -167,6 +171,21 @@ class SubcallBridge:
         entry inside a batch into a ``None`` hole. A failed attempt still cost the
         request that failed, so it counts against ``max_calls_per_cell`` too.
         """
+        return await self.complete(prompt, model)
+
+    async def complete(
+        self, prompt: str, model: str | None = None, *, system: str | None = None
+    ) -> SubcallOutcome:
+        """Stream one completion under an explicit system prompt.
+
+        :meth:`__call__` is the leaf answerer the kernel calls: one question, one
+        parsed answer. A recursion needs the same provider path for a different
+        job -- asking a model to *write the next cell* -- and the only thing that
+        differs is the system prompt, so it differs here rather than in a second
+        implementation that could drift away from the ledger. Every turn of a
+        recursion is a call on this bridge: same ceiling, same tally, so
+        recursion cannot spend its way outside the budget.
+        """
         target = model or self._model()
         limit = self.max_calls_per_cell
         if limit is not None and self._calls >= limit:
@@ -182,7 +201,7 @@ class SubcallBridge:
 
         stream: AsyncIterator[object] = self._provider().stream_response(
             model=target,
-            system=self._system,
+            system=system if system is not None else self._system,
             messages=[UserMessage(content=prompt)],
             tools=[],
             signal=signal,
@@ -222,6 +241,10 @@ class SubcallBridge:
         if response_provider:
             metadata["response_provider"] = response_provider
         return SubcallOutcome(text=text, model=target, metadata=metadata)
+
+    def model_name(self, model: str | None = None) -> str:
+        """The model a sub-call would use, without making one."""
+        return model or self._model()
 
     def _note_model(self, model: str) -> None:
         if model not in self._models:

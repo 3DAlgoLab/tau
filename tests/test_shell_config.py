@@ -85,6 +85,51 @@ def test_code_mode_refuses_a_non_boolean(value: object) -> None:
         shell_settings_from_json({"codeMode": value})
 
 
+def test_recursion_is_off_when_nothing_says_otherwise() -> None:
+    assert ShellSettings().code_mode_recursion is False
+    assert shell_settings_from_json({}).code_mode_recursion is False
+    assert "codeModeRecursion" not in ShellSettings().to_json()
+
+
+def test_recursion_is_opt_in_and_round_trips() -> None:
+    settings = shell_settings_from_json({"codeModeRecursion": True})
+    assert settings.code_mode_recursion is True
+    assert settings.to_json() == {"codeModeRecursion": True}
+
+
+def test_recursion_accepts_the_snake_case_alias() -> None:
+    assert shell_settings_from_json({"code_mode_recursion": True}).code_mode_recursion is True
+
+
+def test_recursion_refuses_both_spellings_at_once() -> None:
+    with pytest.raises(ShellConfigError, match="codeModeRecursion"):
+        shell_settings_from_json({"codeModeRecursion": True, "code_mode_recursion": False})
+
+
+@pytest.mark.parametrize("value", ["true", "on", 1])
+def test_recursion_refuses_a_non_boolean(value: object) -> None:
+    # A truthy string would silently switch on a setting that starts processes.
+    with pytest.raises(ShellConfigError, match="boolean"):
+        shell_settings_from_json({"codeModeRecursion": value})
+
+
+def test_recursion_survives_a_session_without_code_mode() -> None:
+    # Enabling recursions while code mode is off is nonsense but not fatal: the
+    # tool is absent, so the recursion flag has nothing to bind into.
+    settings = shell_settings_from_json({"codeMode": False, "codeModeRecursion": True})
+    assert settings.code_mode is False
+    assert settings.code_mode_recursion is True
+
+
+def test_recursion_is_read_from_the_durable_settings_file(tmp_path: Path) -> None:
+    paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
+    path = shell_settings_path(paths)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"codeModeRecursion": true}', encoding="utf-8")
+
+    assert load_shell_settings(paths).code_mode_recursion is True
+
+
 def test_code_mode_is_read_from_the_durable_settings_file(tmp_path: Path) -> None:
     paths = TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents")
     path = shell_settings_path(paths)

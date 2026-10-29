@@ -32,7 +32,7 @@ from tau_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, T
 from tau_agent.types import JSONValue
 from tau_coding.context_entries import ContextEntries
 from tau_coding.kernel.frames import FrameError
-from tau_coding.kernel.process import ProcessKernel
+from tau_coding.kernel.process import DEFAULT_MAX_CONCURRENT_RLMS, ProcessKernel
 from tau_coding.kernel.protocol import (
     CellResult,
     ContextSource,
@@ -46,6 +46,7 @@ from tau_coding.kernel.subcall import (
     SubcallBridge,
     SubcallTotals,
 )
+from tau_coding.rlm import RlmQuery, RlmTotals
 from tau_coding.tools import ToolInputError, format_size, truncate_head
 
 __all__ = [
@@ -104,6 +105,18 @@ _REPL_DESCRIPTION = (
 )
 
 _REPL_SNIPPET = "Run Python in a persistent per-session kernel (data work, batched model calls)"
+
+_REPL_RECURSION = (
+    " rlm_query(task, model=None) and rlm_query_batched(tasks, model=None) hand "
+    "a task to a child with a kernel and turns of its own, and return its answer "
+    "as text; use them for questions worth a sub-agent, not for a lookup."
+)
+
+_REPL_RECURSION_GUIDELINE = (
+    "Use rlm_query when the sub-task is open-ended enough that solving it means "
+    "writing code you would rather not see: each child is a separate kernel with "
+    "its own turns, and its calls still count against this cell's budget."
+)
 
 _REPL_GUIDELINES: tuple[str, ...] = (
     "Use python_repl when the work is shaped like data: parsing, slicing, counting, "
@@ -177,6 +190,7 @@ class CodeMode:
         cell_timeout_seconds: float = DEFAULT_CELL_TIMEOUT_SECONDS,
         max_concurrent_subcalls: int = 4,
         max_calls_per_cell: int | None = DEFAULT_MAX_SUBCALLS_PER_CELL,
+        recursion_enabled: bool = False,
         kernel_factory: Callable[[], Kernel] | None = None,
     ) -> None:
         self._cwd = cwd
@@ -186,6 +200,13 @@ class CodeMode:
         self._cell_timeout = cell_timeout_seconds
         self._max_concurrent_subcalls = max(1, max_concurrent_subcalls)
         self._max_calls_per_cell = max_calls_per_cell
+        # The recursion ceilings live in RlmLimits, with whoever builds the
+        # RlmQuery; this class only routes requests and reports what they cost.
+        # ``recursion_enabled`` is asked for up front because the tool description
+        # is built before the session has a harness to answer recursions through:
+        # the promise is made early and the runner arrives before the first cell.
+        self._recursion_enabled = recursion_enabled
+        self._rlm: RlmQuery | None = None
         self._kernel_factory = kernel_factory or self._default_kernel
         self._kernel: Kernel | None = None
         self._tool: AgentTool | None = None
@@ -221,17 +242,41 @@ class CodeMode:
             raise RuntimeError("cannot bind a session context after this kernel has run a cell")
         self._context = source
 
+    def bind_recursion(self, rlm: RlmQuery | None) -> None:
+        """Attach the host-side recursion runner for ``rlm_query``.
+
+        Wiring is the caller's job for the same reason the sub-call bridge is:
+        a child kernel needs a factory that can make kernels, and only the owner
+        of kernel construction can supply one. A code mode constructed without
+        ``recursion_enabled`` never advertises the names and never accepts a
+        runner, so the promise in the description and the binding in the
+        namespace cannot drift apart.
+        """
+        if self._kernel is not None:
+            raise RuntimeError("cannot bind recursion after this kernel has run a cell")
+        if rlm is not None and not self._recursion_enabled:
+            raise RuntimeError(
+                "this code mode was not created with recursion enabled; the tool "
+                "description and the namespace bindings have to agree"
+            )
+        self._rlm = rlm
+
     def tool(self) -> AgentTool:
         """Return the session's ``python_repl`` tool."""
         if self._tool is None:
             self._tool = AgentTool(
                 name=PYTHON_REPL_TOOL_NAME,
                 label="python",
-                description=_REPL_DESCRIPTION,
+                description=_REPL_DESCRIPTION
+                + (_REPL_RECURSION if self._recursion_enabled else ""),
                 parameters=_REPL_INPUT_SCHEMA,
                 execute_fn=self._execute,
                 prompt_snippet=_REPL_SNIPPET,
-                prompt_guidelines=_REPL_GUIDELINES,
+                prompt_guidelines=(
+                    _REPL_GUIDELINES + (_REPL_RECURSION_GUIDELINE,)
+                    if self._recursion_enabled
+                    else _REPL_GUIDELINES
+                ),
                 # One namespace, so two cells cannot interleave inside it.
                 execution_mode="sequential",
                 render_call=_render_call,
@@ -259,12 +304,19 @@ class CodeMode:
         """The host-side answerer for kernel sub-calls, if code mode has one."""
         return self._subcall
 
+    @property
+    def recursion(self) -> RlmQuery | None:
+        """The host-side recursion runner, if this code mode was given one."""
+        return self._rlm
+
     def _default_kernel(self) -> Kernel:
         return ProcessKernel(
             cwd=self._cwd,
             subcall=self._subcall,
             context=self._context,
+            rlm=self._rlm,
             max_concurrent_subcalls=self._max_concurrent_subcalls,
+            max_concurrent_rlms=DEFAULT_MAX_CONCURRENT_RLMS,
             cell_timeout_seconds=self._cell_timeout,
             limits=self._limits,
         )
@@ -309,14 +361,25 @@ class CodeMode:
             return _failure_result(
                 "code mode is closed for this session; start a new session to run Python again"
             )
+        if self._recursion_enabled and self._rlm is None:
+            # The description promised rlm_query and nothing was wired to answer
+            # it. That is a wiring bug, so it fails the call in words rather than
+            # letting the model meet a NameError for a name the tool advertised.
+            return _failure_result(
+                "recursion was advertised for this session but never wired, so "
+                "this python_repl cannot answer rlm_query"
+            )
         if signal is not None and signal.is_cancelled():
             raise ToolInputError("Cell cancelled")
 
         kernel = self._kernel_or_new()
         attachments = await self._attach(kernel, _attach_arg(arguments))
         bridge = self._subcall
+        rlm = self._rlm
         if bridge is not None:
             bridge.begin_cell(signal)
+        if rlm is not None:
+            rlm.begin_cell(signal)
         watch: asyncio.Task[None] | None = None
         try:
             if signal is not None:
@@ -328,10 +391,18 @@ class CodeMode:
             if watch is not None:
                 watch.cancel()
             totals = bridge.take_totals() if bridge is not None else None
+            recursion = rlm.take_totals() if rlm is not None else None
             if bridge is not None:
                 bridge.end_cell()
 
-        return _describe(result, totals, kernel, timeout=timeout, attachments=attachments)
+        return _describe(
+            result,
+            totals,
+            kernel,
+            timeout=timeout,
+            attachments=attachments,
+            recursion=recursion,
+        )
 
     async def _watch_cancellation(self, kernel: Kernel, signal: ToolCancellationToken) -> None:
         """Abort the cell when the harness cancels it.
@@ -365,6 +436,7 @@ def _describe(
     *,
     timeout: float,
     attachments: Sequence[tuple[str, int]] = (),
+    recursion: RlmTotals | None = None,
 ) -> AgentToolResult:
     blocks: list[str] = []
     output = result.stdout
@@ -405,6 +477,23 @@ def _describe(
             parts.append(f"{totals.failures} failed")
         blocks.append(f"[{' '.join(parts)}]")
 
+    if recursion is not None and (recursion.children or recursion.fallbacks or recursion.refusals):
+        parts = []
+        if recursion.children:
+            plural = "" if recursion.children == 1 else "s"
+            parts.append(
+                f"{recursion.children} recursion{plural}: {recursion.turns} turns, "
+                f"{recursion.cells} child cell{'' if recursion.cells == 1 else 's'}, "
+                f"depth {recursion.deepest}"
+            )
+        if recursion.fallbacks:
+            parts.append(
+                f"{recursion.fallbacks} answered directly at the depth ceiling (not counted above)"
+            )
+        if recursion.refusals:
+            parts.append(f"{recursion.refusals} refused by the recursion budget")
+        blocks.append(f"[{' | '.join(parts)}]")
+
     if not result.ok and result.error:
         blocks.append(f"[error] {result.error.strip()}")
     if result.timed_out:
@@ -436,6 +525,7 @@ def _describe(
             "alive": kernel.alive,
             "cells_run": kernel.cells_run,
             "subcalls_used": kernel.subcalls_used,
+            "recursions_used": getattr(kernel, "recursions_used", 0),
             "restarts": kernel.restarts,
         },
     }
@@ -443,6 +533,8 @@ def _describe(
         details["attachments"] = [{"name": name, "bytes": size} for name, size in attachments]
     if totals is not None:
         details["subcalls"] = totals.to_json()
+    if recursion is not None:
+        details["recursion"] = recursion.to_json()
 
     return AgentToolResult(content=[TextContent(text="\n\n".join(blocks))], details=details)
 

@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tau_coding.kernel.frames import (
@@ -50,6 +50,9 @@ from tau_coding.kernel.protocol import (
     OP_OUT,
     OP_READY,
     OP_RESET,
+    OP_RLM,
+    OP_RLM_BATCHED,
+    OP_RLM_REPLY,
     OP_SHUTDOWN,
     OP_STARTUP,
     OP_STATE,
@@ -64,8 +67,11 @@ from tau_coding.kernel.scaffold import (
     CONTEXT_OPEN,
     LLM_QUERY,
     LLM_QUERY_BATCHED,
+    RECURSION_BINDINGS,
     RESERVED,
     RET,
+    RLM_QUERY,
+    RLM_QUERY_BATCHED,
     SHOW_VARS,
 )
 
@@ -131,7 +137,7 @@ class _Channel:
             if reply is None:
                 raise KernelSubcallError("kernel channel closed mid-request")
             if (
-                reply.get("op") not in (OP_SUBCALL_REPLY, OP_CONTEXT_REPLY)
+                reply.get("op") not in (OP_SUBCALL_REPLY, OP_CONTEXT_REPLY, OP_RLM_REPLY)
                 or reply.get("req_id") != req_id
             ):
                 raise KernelSubcallError("unexpected frame while waiting for a host reply")
@@ -285,9 +291,22 @@ def _safe_json(value: Any) -> tuple[Any, str | None]:
 class _Kernel:
     """The child's namespace and frame dispatch."""
 
-    def __init__(self, channel: _Channel, max_cell_output_bytes: int) -> None:
+    def __init__(
+        self,
+        channel: _Channel,
+        max_cell_output_bytes: int,
+        bindings: Sequence[str] | None = None,
+    ) -> None:
         self._channel = channel
         self._max_cell_output_bytes = max(1, max_cell_output_bytes)
+        # The host decides which optional bindings this namespace gets, and the
+        # child reports back what it actually bound: a name advertised in the
+        # ready frame but missing here is a NameError for whoever trusted it.
+        self.bindings: tuple[str, ...] = (
+            tuple(bindings)
+            if bindings is not None
+            else tuple(name for name in BINDINGS if name not in RECURSION_BINDINGS)
+        )
         self._ns: dict[str, Any] = {}
         self._reassert()
 
@@ -299,6 +318,10 @@ class _Kernel:
         ns["__builtins__"] = builtins
         ns[LLM_QUERY] = self._llm_query
         ns[LLM_QUERY_BATCHED] = self._llm_query_batched
+        if RLM_QUERY in self.bindings:
+            ns[RLM_QUERY] = self._rlm_query
+        if RLM_QUERY_BATCHED in self.bindings:
+            ns[RLM_QUERY_BATCHED] = self._rlm_query_batched
         ns[CONTEXT_INDEX] = self._context_index
         ns[CONTEXT_OPEN] = self._context_open
         ns[SHOW_VARS] = self._show_vars
@@ -370,6 +393,28 @@ class _Kernel:
         responses = reply.get("responses", [])
         if not isinstance(responses, list):
             raise KernelSubcallError("sub-call batch reply was malformed")
+        return [None if item is None else str(item) for item in responses]
+
+    def _rlm_query(self, task: str, model: str | None = None) -> str:
+        if not isinstance(task, str):
+            raise TypeError("rlm_query(task) needs a string task")
+        reply = self._channel.request({"op": OP_RLM, "task": task, "model": model})
+        error = reply.get("error")
+        if error is not None:
+            raise KernelSubcallError(str(error))
+        text = reply.get("text", "")
+        return text if isinstance(text, str) else str(text)
+
+    def _rlm_query_batched(self, tasks: list[str], model: str | None = None) -> list[str | None]:
+        if not isinstance(tasks, list):
+            raise TypeError("rlm_query_batched(tasks) needs a list of strings")
+        reply = self._channel.request({"op": OP_RLM_BATCHED, "tasks": list(tasks), "model": model})
+        error = reply.get("error")
+        if error is not None:
+            raise KernelSubcallError(str(error))
+        responses = reply.get("responses", [])
+        if not isinstance(responses, list):
+            raise KernelSubcallError("recursion batch reply was malformed")
         return [None if item is None else str(item) for item in responses]
 
     def execute(self, frame: Mapping[str, Any]) -> None:
@@ -508,14 +553,20 @@ def main() -> int:
     except (TypeError, ValueError):
         max_output_bytes = DEFAULT_CELL_OUTPUT_BYTES
 
-    kernel = _Kernel(channel, max_output_bytes)
+    raw_bindings = startup.get("bindings")
+    bindings = (
+        tuple(name for name in raw_bindings if isinstance(name, str))
+        if isinstance(raw_bindings, (list, tuple))
+        else None
+    )
+    kernel = _Kernel(channel, max_output_bytes, bindings)
     channel.send(
         {
             "op": OP_READY,
             "pid": os.getpid(),
             "python": platform.python_version(),
             "limits": notes,
-            "bindings": list(BINDINGS),
+            "bindings": list(kernel.bindings),
         }
     )
 

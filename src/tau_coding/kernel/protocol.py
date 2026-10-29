@@ -39,6 +39,9 @@ OP_READY = "ready"
 OP_SUBCALL = "subcall"
 OP_SUBCALL_BATCHED = "subcall_batched"
 OP_SUBCALL_REPLY = "subcall_reply"
+OP_RLM = "rlm"
+OP_RLM_BATCHED = "rlm_batched"
+OP_RLM_REPLY = "rlm_reply"
 OP_CONTEXT = "context"
 OP_CONTEXT_REPLY = "context_reply"
 
@@ -176,6 +179,17 @@ class SubcallOutcome:
 SubcallFn = Callable[[str, str | None], Awaitable[SubcallOutcome]]
 """Host-side completion the kernel can ask for, one prompt at a time."""
 
+RlmFn = Callable[[str, str | None], Awaitable[SubcallOutcome]]
+"""Host-side recursion the kernel can ask for, one task at a time.
+
+On the wire a recursion is indistinguishable from a sub-call -- a task goes
+out, an answer comes back -- which is why it reuses :class:`SubcallOutcome`.
+What differs is what the host does with it: a sub-call is one provider request,
+a recursion is a child that works in its own kernel until it answers. Depth,
+turn count and the ceiling are policy, so they travel as opaque ``metadata``
+and the kernel forwards them without interpreting them.
+"""
+
 
 class ContextSource(Protocol):
     """Host-side supplier of addressed session-context handles.
@@ -294,6 +308,9 @@ __all__ = [
     "OP_OUT",
     "OP_READY",
     "OP_RESET",
+    "OP_RLM",
+    "OP_RLM_BATCHED",
+    "OP_RLM_REPLY",
     "OP_SHUTDOWN",
     "OP_STARTUP",
     "OP_STATE",
@@ -309,6 +326,7 @@ __all__ = [
     "KernelUnavailableError",
     "KernelState",
     "KernelVar",
+    "RlmFn",
     "SubcallFn",
     "SubcallOutcome",
     "bounded_text",
