@@ -32,12 +32,13 @@ Porting Pi's some essential features to Tau
   `examples/extensions/stall_guard.py` and covered by two new tests; the core-side half is
   `2e31f09`.
 
-- [ ] Installed runtime lags the repo — the live `tau` (uv tool env, `tau-ai 0.4.9b2`) still has
-  no `_compact_context_before_request` and no truncation recovery, which is exactly why the
-  2026-11-03 stall happened while the repo already contained half the fix. Either install the
-  checkout into the tool env (`uv tool install --editable .`) or cut the next beta and reinstall;
-  after either, re-verify with
-  `grep -c "_compact_context_before_request" ~/.local/share/uv/tools/tau-ai/lib/python3.13/site-packages/tau_coding/session.py`.
+- [x] Installed runtime lags the repo — **closed 2026-11-03** (`af24b25` + reinstall): the live
+  `tau` was still 0.4.9b2 and had neither `_compact_context_before_request` nor
+  `_recover_from_truncated_turn`, which is why the stall reproduced there while the repo already
+  contained half the fix. Bumped to `0.4.9b3` and refreshed the tool env with
+  `uv tool install --force .`. Verify after any future bump with
+  `grep -c "_compact_context_before_request\|_recover_from_truncated_turn" ~/.local/share/uv/tools/tau-ai/lib/python3.13/site-packages/tau_coding/session.py`
+  (now 3 and 3) and `tau --version`.
 
 - [ ] Heartbeat / `schedule_prompt` port — **installable and verified loading as of
   2026-11-02, still NOT official** (out-of-tree at `../tau-schedule-prompt`); see
@@ -463,21 +464,30 @@ Extension install notes
 - The venv follow-up is committed: `81ff167` landed it, alongside `abdd490` (stall guard) and
   `a6dc016` (python kernel).
 
-Publishing state (verified 2026-11-03, after `be12417`)
+Publishing state (re-verified 2026-11-03, at `af24b25`)
 - `origin` is `github.com/3DAlgoLab/tau`, a fork of `huggingface/tau`. `main` is **level with
-  `origin/main`**; the only uncommitted work is the compaction change (`+338/−52`, 7 files).
-- `publish.yml` triggers only on `release: published`, so pushing `main` cannot publish `0.4.9b2`;
-  `docs.yml` does run on push to `main`. `gh api …/actions/runs` returns `total_count: 0`, so no CI
-  run registered for these pushes — local checks under `TZ=UTC` are the only gate in practice.
+  `origin/main`**; the working tree is clean.
+- **PyPI has never carried the fork's work.** `https://pypi.org/pypi/tau-ai/json` reports latest
+  `0.4.8`, with no `0.4.9b2` and no `0.4.9b3`. So `666257c` and `af24b25` are local-only version
+  bumps that make `tau --version` distinguishable; they publish nothing.
+- Publishing from this fork is not wired: no releases, no tags, and no `pypi` GitHub environment
+  (`gh api …/environments` is empty), and `publish.yml` (`uv build` + `uv publish`, OIDC into
+  environment `pypi`) only fires on `release: published`. Publishing the name `tau-ai` also needs
+  PyPI ownership, which the fork does not have. Treat upstream `huggingface/tau` as the only
+  publisher.
+- The live tool is **not** a PyPI install: `direct_url.json` in the tool env reads
+  `{"url":"file:///home/j2y/dev-pi/tau","dir_info":{}}`, i.e. a non-editable install from this
+  checkout. Refresh it after a bump with `uv tool install --force .`; `uv tool upgrade` will not
+  see prereleases and the updater refuses outright once a direct URL is recorded.
+- `gh api …/actions/runs` still returns `total_count: 0`, so no CI run registered for these pushes
+  — local checks under `TZ=UTC` are the only gate in practice.
 - Guideline audit against `CONTRIBUTING.md`: every local commit carries tests + a `dev-notes/` note +
   a `website/content/` update, `tau_agent` gained no CLI/TUI/path imports, and
   `ruff check` / `ruff format --check` / `mypy` are clean. Roadmap alignment is unverifiable while the
   roadmap issue lives upstream at `huggingface/tau#1`.
-- `666257c chore: release 0.4.9b2` bumps `pyproject.toml`, which the release workflow publishes on —
-  CONTRIBUTING says that bump must reach `main` through a PR, so keep it out of a feature push.
-- Work in progress, uncommitted: request-boundary compaction and repeated overflow recovery
-  (`src/tau_agent/harness.py`, `src/tau_agent/loop.py`, `src/tau_coding/session.py`, two test files,
-  `website/content/guides/context.md`), journaled in `dev-notes/context-overflow-recovery.md`.
+- CONTRIBUTING wants a version bump to reach `main` through a PR; `af24b25` went straight to the
+  fork's `main`, which is fine for a local-only prerelease and worth revisiting before any
+  upstream contribution.
 
 Which copy is live (verified 2026-11-03)
 - The **installed** copy is what runs. `~/.tau/extensions/tau-schedule-prompt` holds `cpython-313`
@@ -485,6 +495,9 @@ Which copy is live (verified 2026-11-03)
   and only used to run its tests. Nothing in this repo points at the source tree.
 - Check drift before trusting either side:
   `diff -rq --exclude=__pycache__ --exclude=.venv --exclude=.ruff_cache ~/.tau/extensions/tau-schedule-prompt ../tau-schedule-prompt`
-  — today they differ only in `README.md`, so the installed tree is one docs edit behind.
+  — as of 2026-11-03 the **source tree is ahead**: `timeutils.py`, `scheduler.py`, `extension.py`,
+  `tool.py` and `README.md` carry uncommitted local-time formatting work (`format_local` /
+  `format_short`, mtimes 2026-11-03 01:31) that the installed copy (2026-11-02 21:23) does not
+  have. Reinstall once that tree settles; the git history there is still a single `first commit`.
 - Reload rule: `tau install --force` replaces the copy, but a running session keeps the old one until
   restart.
