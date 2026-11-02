@@ -20,13 +20,20 @@ than cosmetic:
 * No namespace snapshots: handles cannot be pickled, so a rebuilt kernel starts
   empty and says so out loud.
 
-Interpreter choice: the kernel runs the *project's* virtualenv -- `<cwd>/.venv`,
-or the nearest one at or above cwd, bounded by the repo root (or `$HOME`) so a
-stray `~/.venv` cannot hijack an unrelated project. That keeps the packages the
-agent installs in the environment the repository actually runs. Modes, via
-`TAU_PY_VENV`: `prefer` (default) uses an existing venv and tells the model to
-create the missing one with uv; `require` provisions it with uv before the first
-cell; `off` restores plain PATH lookup. `TAU_PYTHON` still pins outright.
+Interpreter choice: the kernel runs the *project's* environment -- `<cwd>/.venv`
+or `venv`, or the nearest one at or above cwd, bounded by the repo root (or
+`$HOME`) so a stray `~/.venv` cannot hijack an unrelated project. A folder that
+declares a project with `pyproject.toml` but has no environment yet keeps the
+project rule: the fix is to create that environment, not to leave the project.
+When nothing at or above cwd declares a project, the session falls back to one
+shared environment, `<TAU_HOME>/.venv` (`~/.tau/.venv` by default), instead of
+the shell's system python. Dependency manifests (`uv.lock`, `requirements*.txt`)
+claim a folder the same way `pyproject.toml` does, so their packages never land in
+the shared environment. That keeps the packages the agent installs in an
+environment that survives the session either way. Modes, via `TAU_PY_VENV`:
+`prefer` (default) uses an existing environment and tells the model to create the
+missing one with uv; `require` provisions it with uv before the first cell; `off`
+restores plain PATH lookup. `TAU_PYTHON` still pins outright.
 
 Install by copying into `~/.tau/extensions/`, or run:
 
@@ -73,11 +80,20 @@ DEFAULT_CELL_TIMEOUT_MS = 0
 BOOT_TIMEOUT_SECONDS = 90.0
 REAP_WAIT_SECONDS = 2.0
 
-# Project-venv resolution and uv provisioning.
+# Environment resolution and uv provisioning. A project owns its environment when
+# the cwd (or an ancestor inside the search bound) names one; otherwise the kernel
+# falls back to one shared environment under TAU_HOME instead of whatever `python3`
+# the shell happens to expose.
 VENV_DIR_NAME = ".venv"
+VENV_DIR_NAMES = (".venv", "venv")
+REQUIREMENTS_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-test.txt")
+# What claims a folder's environment: an environment directory, a project manifest, or a
+# dependency manifest. A folder holding none of these has no environment of its own to
+# fill, so its sessions share one instead of landing on the system interpreter.
+PROJECT_MARKERS = (*VENV_DIR_NAMES, "pyproject.toml", "uv.lock", *REQUIREMENTS_FILES)
+SHARED_VENV_DIR_NAME = ".venv"
 DEFAULT_VENV_MODE = "prefer"
 VENV_MODES = ("off", "prefer", "require")
-REQUIREMENTS_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-test.txt")
 PROVISION_TIMEOUT_SECONDS = 300.0
 
 REAPED_NOTICE = (
@@ -284,19 +300,22 @@ class KernelGone(RuntimeError):
 
 @dataclass(frozen=True)
 class VenvReport:
-    """What the project-venv rule saw under this cwd, and what it decided."""
+    """What the environment rule saw under this cwd, and what it decided."""
 
     mode: str  # off | prefer | require
     state: str  # active | missing | broken | pinned | off
     venv_dir: Path | None = None
     interpreter: Path | None = None
     note: str = ""
+    scope: str = "project"  # project | shared | none
+    create_dir: Path | None = None  # where uv would create the environment
 
     def render(self) -> str:
         """Render one status line for /python and for cell output."""
-        where = str(self.venv_dir) if self.venv_dir is not None else "none at or above cwd"
+        located = self.venv_dir or self.create_dir
+        where = str(located) if located is not None else "none at or above cwd"
         tail = f" -- {self.note}" if self.note else ""
-        return f"{self.state}: {where} (mode={self.mode}){tail}"
+        return f"{self.state}: {where} (mode={self.mode}, scope={self.scope}){tail}"
 
 
 @dataclass(frozen=True)
@@ -342,6 +361,50 @@ def _venv_python(venv_dir: Path) -> Path:
     return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def _home_dir(env: Mapping[str, str]) -> Path | None:
+    """Return the user home the resolution should trust for this call."""
+    home_raw = (env.get("HOME") or "").strip()
+    if not home_raw and os.name != "nt":
+        home_raw = os.path.expanduser("~")
+    return Path(home_raw) if home_raw else None
+
+
+def tau_home_dir(env: Mapping[str, str]) -> Path | None:
+    """Return Tau's data home, mirroring `tau_coding.paths`: `TAU_HOME` else `~/.tau`."""
+    pinned = (env.get("TAU_HOME") or "").strip()
+    if pinned:
+        try:
+            return Path(pinned).expanduser()
+        except RuntimeError:
+            return None
+    home = _home_dir(env)
+    return None if home is None else home / ".tau"
+
+
+def shared_venv_dir(env: Mapping[str, str]) -> Path | None:
+    """Return the one environment shared by every session with no project of its own."""
+    home = tau_home_dir(env)
+    return None if home is None else home / SHARED_VENV_DIR_NAME
+
+
+def has_project_marker(cwd: Path, env: Mapping[str, str]) -> bool:
+    """Return whether this cwd, or an ancestor in scope, claims its own Python.
+
+    `.venv`, `venv`, `pyproject.toml`, `uv.lock`, and the requirements files each mean
+    "this folder owns its Python". A folder with none of them has no environment to
+    install into, so its session runs in the shared one instead of inventing a project
+    boundary or landing on the system interpreter.
+    """
+    bound = _venv_search_bound(cwd, _home_dir(env))
+    current = cwd
+    while True:
+        if any((current / name).exists() for name in PROJECT_MARKERS):
+            return True
+        if current == bound or current.parent == current:
+            return False
+        current = current.parent
+
+
 def _git_root(cwd: Path) -> Path | None:
     """Return the nearest ancestor holding `.git`, if any."""
     for candidate in (cwd, *cwd.parents):
@@ -365,25 +428,23 @@ def _venv_search_bound(cwd: Path, home: Path | None) -> Path:
 
 
 def find_project_venv(cwd: Path, env: Mapping[str, str]) -> tuple[Path | None, Path | None]:
-    """Return ``(venv_dir, interpreter)`` for the nearest `.venv` at or above cwd.
+    """Return ``(venv_dir, interpreter)`` for the nearest project env at or above cwd.
 
     ``interpreter`` is None when the directory exists but holds no usable
     interpreter; the caller reports that as a broken venv instead of quietly
     falling back to the system python.
     """
-    home_raw = (env.get("HOME") or "").strip()
-    if not home_raw and os.name != "nt":
-        home_raw = os.path.expanduser("~")
-    home = Path(home_raw) if home_raw else None
+    home = _home_dir(env)
     bound = _venv_search_bound(cwd, home)
     current = cwd
     while True:
         # $HOME's own venv only counts when the session actually runs in $HOME.
         if not (home is not None and current == home and cwd != home):
-            candidate = current / VENV_DIR_NAME
-            if candidate.is_dir():
-                python = _venv_python(candidate)
-                return candidate, (python if python.is_file() else None)
+            for name in VENV_DIR_NAMES:
+                candidate = current / name
+                if candidate.is_dir():
+                    python = _venv_python(candidate)
+                    return candidate, (python if python.is_file() else None)
         if current == bound or current.parent == current:
             return None, None
         current = current.parent
@@ -395,56 +456,102 @@ def uv_binary(env: Mapping[str, str]) -> str | None:
     return pinned or shutil.which("uv", path=env.get("PATH"))
 
 
+@dataclass(frozen=True)
+class EnvTarget:
+    """Where this cwd's Python environment lives, or where uv would create it."""
+
+    venv_dir: Path | None  # an environment directory that already exists
+    interpreter: Path | None  # its interpreter; None when absent or half-created
+    scope: str  # project | shared
+    create_dir: Path  # where `uv venv` would lay the environment down
+
+
+def resolve_env_target(cwd: Path, env: Mapping[str, str]) -> EnvTarget:
+    """Resolve the environment for one cwd: the project's own, else the shared one.
+
+    The project rule wins whenever a folder at or above cwd claims its Python, and it
+    stays in force when the claim is only a manifest -- that folder's packages belong
+    in its own environment, so `create_dir` points there. Otherwise the session uses
+    the one environment under TAU_HOME, which keeps a scratch cwd off the system
+    interpreter without pretending it has a project of its own.
+    """
+    venv_dir, venv_python = find_project_venv(cwd, env)
+    if venv_dir is not None:
+        return EnvTarget(venv_dir, venv_python, "project", venv_dir)
+    if not has_project_marker(cwd, env):
+        shared = shared_venv_dir(env)
+        if shared is not None:
+            python = _venv_python(shared)
+            return EnvTarget(
+                shared if shared.is_dir() else None,
+                python if python.is_file() else None,
+                "shared",
+                shared,
+            )
+    return EnvTarget(None, None, "project", cwd / VENV_DIR_NAME)
+
+
 def choose_interpreter(env: Mapping[str, str], cwd: Path) -> tuple[str, str, VenvReport]:
     """Pick the interpreter and name the rule that picked it.
 
-    Order: an explicit pin, then the project `.venv`, then PATH, then Tau's own
-    interpreter. A pin wins over the venv so `TAU_PYTHON=/path/to/env` stays a
-    one-line escape hatch; `TAU_PY_VENV` tunes the venv rule itself.
+    Order: an explicit pin, then the project's own environment, then the shared
+    `<TAU_HOME>/.venv`, then PATH, then Tau's own interpreter. A project owns its
+    environment when the cwd or an in-scope ancestor holds `.venv`, `venv`,
+    `pyproject.toml`, or a dependency manifest; with none of those there is no
+    project to install into, so the session gets one shared environment instead of
+    the shell's system python. A pin wins over both so `TAU_PYTHON=/path/to/env`
+    stays a one-line escape hatch; `TAU_PY_VENV` tunes the rule itself.
     """
     mode = (env.get("TAU_PY_VENV") or DEFAULT_VENV_MODE).strip().lower()
     if mode not in VENV_MODES:
         mode = DEFAULT_VENV_MODE
-    venv_dir, venv_python = find_project_venv(cwd, env)
+    target = resolve_env_target(cwd, env)
 
     for variable in ("TAU_PYTHON", "PYTOOL_PYTHON", "PI_PYTHON"):
         pinned = (env.get(variable) or "").strip()
         if pinned:
             note = (
-                f"{venv_dir} ignored because {variable} pins the interpreter"
-                if mode != "off" and venv_dir is not None
+                f"{target.venv_dir} ignored because {variable} pins the interpreter"
+                if mode != "off" and target.venv_dir is not None
                 else ""
             )
             return (
                 pinned,
                 f"{variable} pin",
-                VenvReport(mode, "pinned", venv_dir, venv_python, note),
+                VenvReport(mode, "pinned", target.venv_dir, target.interpreter, note, target.scope),
             )
 
     if mode == "off":
-        state = "off"
-    elif venv_dir is None:
-        state = "missing"
-    else:
-        state = "active" if venv_python is not None else "broken"
+        return _path_fallback(env, VenvReport(mode, "off", scope="none"))
 
-    if state == "active" and venv_python is not None:
+    if target.interpreter is not None:
         return (
-            str(venv_python),
-            f"project venv {venv_dir}",
-            VenvReport(mode, state, venv_dir, venv_python),
+            str(target.interpreter),
+            f"{target.scope} venv {target.venv_dir}",
+            VenvReport(mode, "active", target.venv_dir, target.interpreter, scope=target.scope),
         )
 
-    note = ""
+    state = "broken" if target.venv_dir is not None else "missing"
+    create_dir = target.create_dir
     if state == "broken":
-        note = f"{venv_dir} holds no interpreter; recreate it with `uv venv`"
-    elif state == "missing" and mode == "require":
-        note = "uv will create it before the first cell"
+        note = f"{target.venv_dir} holds no interpreter; recreate it with `uv venv`"
+    elif mode == "require":
+        note = f"uv will create {create_dir} before the first cell"
+    else:
+        note = f"no environment at {create_dir} yet; create it with `uv venv {create_dir}`"
+    return _path_fallback(
+        env,
+        VenvReport(mode, state, target.venv_dir, None, note, target.scope, target.create_dir),
+    )
+
+
+def _path_fallback(env: Mapping[str, str], report: VenvReport) -> tuple[str, str, VenvReport]:
+    """Fall back to PATH, then to the interpreter Tau itself runs on."""
     for name in ("python3", "python"):
         found = shutil.which(name, path=env.get("PATH"))
         if found:
-            return found, f"PATH {name}", VenvReport(mode, state, venv_dir, venv_python, note)
-    return sys.executable, "tau interpreter", VenvReport(mode, state, venv_dir, venv_python, note)
+            return found, f"PATH {name}", report
+    return sys.executable, "tau interpreter", report
 
 
 def settings_from_env(env: Mapping[str, str], cwd: Path) -> KernelSettings:
@@ -463,7 +570,7 @@ def settings_from_env(env: Mapping[str, str], cwd: Path) -> KernelSettings:
 
 @dataclass
 class ProvisionReport:
-    """What uv did (or refused to do) for the project venv."""
+    """What uv did (or refused to do) for the resolved environment."""
 
     ok: bool
     state: str
@@ -478,7 +585,7 @@ class ProvisionReport:
 
 
 def provision_steps(venv_dir: Path, cwd: Path) -> list[list[str]]:
-    """Plan the uv commands that fill a project venv from its manifests.
+    """Plan the uv commands that fill a project environment from its manifests.
 
     A lockfile means the project owns its resolution, so `uv sync` is the right
     call; with only requirements files, install those into the venv directly and
@@ -499,9 +606,9 @@ def _provision_plan(
     cwd: Path, env: Mapping[str, str], *, force: bool = False
 ) -> tuple[ProvisionReport | None, list[list[str]]]:
     """Shared front end for both runners: reuse, refuse, or lay out the uv argvs."""
-    venv_dir, venv_python = find_project_venv(cwd, env)
-    if not force and venv_python is not None:
-        return ProvisionReport(True, "reused", [f"reused {venv_python}"]), []
+    target = resolve_env_target(cwd, env)
+    if not force and target.interpreter is not None:
+        return ProvisionReport(True, "reused", [f"reused {target.interpreter}"]), []
     uv = uv_binary(env)
     if uv is None:
         return (
@@ -513,8 +620,11 @@ def _provision_plan(
             ),
             [],
         )
-    target = venv_dir or (cwd / VENV_DIR_NAME)
-    argvs = [["uv", "venv", str(target)], *provision_steps(target, cwd)]
+    venv_dir = target.create_dir
+    # Only a project environment gets filled from manifests: the shared one belongs to
+    # no repository, so installing this cwd's requirements into it would leak.
+    steps = provision_steps(venv_dir, cwd) if target.scope == "project" else []
+    argvs = [["uv", "venv", str(venv_dir)], *steps]
     return None, [[uv, *argv[1:]] for argv in argvs]
 
 
@@ -530,7 +640,7 @@ def _provision_report(actions: list[str], log: list[str], failed: bool) -> Provi
 def provision_venv_sync(
     cwd: Path, env: Mapping[str, str], *, force: bool = False
 ) -> ProvisionReport:
-    """Create/refresh `<project>/.venv` with uv, blocking (`/python venv`)."""
+    """Create/refresh the resolved environment with uv, blocking (`/python venv`)."""
     early, plan = _provision_plan(cwd, env, force=force)
     if early is not None:
         return early
@@ -986,7 +1096,7 @@ def setup(tau: ExtensionAPI) -> None:
         return kernel, note
 
     async def venv_bootstrap() -> str:
-        """Provision the project venv in `require` mode, or hint once in `prefer`."""
+        """Provision the resolved environment in `require` mode, or hint once in `prefer`."""
         nonlocal venv_hint_shown
         if settings.venv.state in ("active", "pinned", "off"):
             return ""
@@ -997,9 +1107,14 @@ def setup(tau: ExtensionAPI) -> None:
             return f"{report.render()}\nvenv: falling back to {settings.interpreter}"
         if not venv_hint_shown:
             venv_hint_shown = True
+            if settings.venv.scope == "project":
+                how = "`uv venv && uv pip install -r requirements.txt` (or `uv sync`)"
+            else:
+                create_dir = settings.venv.create_dir or cwd / VENV_DIR_NAME
+                how = f"`uv venv {create_dir}`"
             return (
-                f"venv: {settings.venv.render()} -- create it with `uv venv && uv pip install "
-                "-r requirements.txt` (or `uv sync`) and the next cell runs inside it."
+                f"venv: {settings.venv.render()} -- create it with {how} "
+                "and the next cell runs inside it."
             )
         return ""
 
@@ -1040,7 +1155,7 @@ def setup(tau: ExtensionAPI) -> None:
                 "status: error\n"
                 f"error: cannot start the kernel at {settings.interpreter} "
                 f"(picked by {settings.interpreter_source})\n{exc}\n"
-                "Set TAU_PYTHON to a working interpreter, create the project venv with `uv venv`, "
+                "Set TAU_PYTHON to a working interpreter, create the environment with `uv venv`, "
                 "or run /python to see what was picked."
             )
             return AgentToolResult(content=[TextContent(text=text)], details=details)
@@ -1076,9 +1191,11 @@ def setup(tau: ExtensionAPI) -> None:
                 f"namespace; a cell that ignores an interrupt has its kernel killed, which empties "
                 f"the namespace and is reported as reaped. Output is capped at "
                 f"{settings.max_output_chars} chars per cell with an explicit marker. The kernel "
-                "runs the project's own `.venv` (nearest one at or above the cwd) so installed "
-                "packages land where the repository runs; a failed import means installing into "
-                "that environment, and /python names the interpreter."
+                "runs the project's own environment (`.venv` or `venv`, nearest one at or above "
+                "the cwd) so installed packages land where the repository runs; a folder that "
+                "declares no project falls back to one shared environment under Tau's home. A "
+                "failed import means installing into that environment, and /python names the "
+                "interpreter."
             ),
             parameters={
                 "type": "object",
@@ -1108,10 +1225,12 @@ def setup(tau: ExtensionAPI) -> None:
                 "re-importing, reloading or recomputing them.",
                 "Look before acting: print the minimal view that answers the question. The last "
                 "expression's value comes back on its own.",
-                "The kernel prefers the project's `.venv`. If a cell reports `venv: missing` or "
-                "`venv: broken`, create or repair it in bash with `uv venv` plus `uv sync` or "
-                "`uv pip install -r requirements.txt`; the next cell moves into it and says the "
-                "namespace was reset. Never delete a working `.venv`.",
+                "The kernel runs the project's environment when the folder has `.venv`, `venv`, "
+                "or `pyproject.toml`, and one shared environment otherwise. If a cell reports "
+                "`venv: missing` or `venv: broken`, create or repair the named environment in "
+                "bash with `uv venv` plus `uv sync` or `uv pip install -r requirements.txt`; the "
+                "next cell moves into it and says the namespace was reset. Never delete a working "
+                "environment.",
                 "Drive blocking APIs (RPC, COM, sockets) as many short calls, never one long "
                 "batch: an interrupt cannot cut a call parked inside C, and the only way back is "
                 "killing the kernel and losing every name and handle.",

@@ -105,7 +105,7 @@ def test_interpreter_ladder_prefers_an_explicit_pin(tmp_path: Any) -> None:
 def test_interpreter_ladder_uses_a_path_interpreter_before_taus_own(tmp_path: Any) -> None:
     module = _load_extension()
     resolved, rule, _report = module.choose_interpreter(
-        {"PATH": str(Path(sys.executable).parent)}, tmp_path
+        {"HOME": str(tmp_path / "home"), "PATH": str(Path(sys.executable).parent)}, tmp_path
     )
 
     assert rule.startswith("PATH")
@@ -116,7 +116,9 @@ def test_interpreter_ladder_falls_back_to_the_tau_interpreter(tmp_path: Any) -> 
     module = _load_extension()
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
-    resolved, rule, _report = module.choose_interpreter({"PATH": str(empty_bin)}, tmp_path)
+    resolved, rule, _report = module.choose_interpreter(
+        {"HOME": str(tmp_path / "home"), "PATH": str(empty_bin)}, tmp_path
+    )
 
     assert (resolved, rule) == (sys.executable, "tau interpreter")
 
@@ -148,15 +150,15 @@ def _touch(path: Path, text: str = "") -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _make_venv(root: Path) -> Path:
+def _make_venv(root: Path, name: str = ".venv") -> Path:
     """Create a real venv the tests can execute, using the running interpreter."""
     subprocess.run(
-        [sys.executable, "-m", "venv", str(root / ".venv")],
+        [sys.executable, "-m", "venv", str(root / name)],
         check=True,
         capture_output=True,
         text=True,
     )
-    return root / ".venv"
+    return root / name
 
 
 def _home_env(tmp_path: Path) -> dict[str, str]:
@@ -269,13 +271,17 @@ def test_venv_mode_off_ignores_the_venv(tmp_path: Path) -> None:
 def test_a_missing_venv_in_require_mode_says_uv_will_create_it(tmp_path: Path) -> None:
     module = _load_extension()
     project = tmp_path / "proj"
-    project.mkdir()
+    _touch(project / "pyproject.toml", "[project]\nname='x'\n")
 
     _interpreter, _source, report = module.choose_interpreter(
         {**_home_env(tmp_path), "TAU_PY_VENV": "require"}, project
     )
 
-    assert (report.state, report.venv_dir) == ("missing", None)
+    assert (report.state, report.venv_dir, report.create_dir) == (
+        "missing",
+        None,
+        project / ".venv",
+    )
     assert "uv" in report.note
 
 
@@ -288,6 +294,124 @@ def test_a_broken_venv_is_not_silently_replaced(tmp_path: Path) -> None:
 
     assert report.state == "broken"
     assert "uv venv" in report.note
+
+
+# -- project vs shared environment -------------------------------------------
+
+
+def test_a_venv_directory_also_counts_as_the_project_env(tmp_path: Path) -> None:
+    """`venv` is a project environment too, so a repo that names it that way is honored."""
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _touch(project / "venv" / "bin" / "python", "#!/bin/sh\n")
+
+    venv_dir, interpreter = module.find_project_venv(project, _home_env(tmp_path))
+
+    assert venv_dir == project / "venv"
+    assert interpreter == project / "venv" / "bin" / "python"
+
+
+def test_a_manifest_keeps_a_folder_in_project_scope(tmp_path: Path) -> None:
+    """`pyproject.toml` with no environment yet is still the project's, not the shared one."""
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _touch(project / "pyproject.toml", "[project]\nname='x'\n")
+
+    _interpreter, _source, report = module.choose_interpreter(_home_env(tmp_path), project)
+
+    assert (report.state, report.scope, report.venv_dir) == ("missing", "project", None)
+    assert report.create_dir == project / ".venv"
+
+
+def test_a_plain_folder_uses_the_shared_environment(tmp_path: Path) -> None:
+    """With no project marker anywhere in scope, the kernel runs `~/.tau/.venv`."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    shared = _make_venv(tmp_path / "home" / ".tau")
+
+    interpreter, source, report = module.choose_interpreter(_home_env(tmp_path), scratch)
+
+    assert interpreter == str(shared / "bin" / "python")
+    assert source == f"shared venv {shared}"
+    assert (report.state, report.scope) == ("active", "shared")
+
+
+def test_a_missing_shared_environment_falls_back_to_path(tmp_path: Path) -> None:
+    """The shared environment is used when present, named for creation when it is not."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    interpreter, _source, report = module.choose_interpreter(
+        {**_home_env(tmp_path), "PATH": str(Path(sys.executable).parent)}, scratch
+    )
+
+    assert (report.state, report.scope) == ("missing", "shared")
+    assert report.create_dir == tmp_path / "home" / ".tau" / ".venv"
+    assert str(report.create_dir) in report.note
+    assert Path(interpreter).parent == Path(sys.executable).parent
+
+
+def test_tau_home_moves_the_shared_environment(tmp_path: Path) -> None:
+    """The shared environment follows TAU_HOME, the same home Tau itself uses."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    shared = _make_venv(tmp_path / "tau-home")
+    env = {**_home_env(tmp_path), "TAU_HOME": str(tmp_path / "tau-home")}
+
+    interpreter, _source, report = module.choose_interpreter(env, scratch)
+
+    assert (report.state, report.scope) == ("active", "shared")
+    assert interpreter == str(shared / "bin" / "python")
+
+
+def test_a_manifest_only_folder_still_gets_its_own_env(tmp_path: Path) -> None:
+    """A dependency manifest claims the folder, so its packages never reach the shared env."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    _touch(scratch / "requirements.txt", "numpy\n")
+    log = tmp_path / "uv.log"
+    stub = tmp_path / "uv"
+    _touch(stub, f"#!/bin/sh\necho \"$@\" >> '{log}'\n")
+    stub.chmod(0o755)
+
+    report = module.provision_venv_sync(scratch, {**_home_env(tmp_path), "TAU_PY_UV": str(stub)})
+
+    assert report.ok, report.render()
+    lines = log.read_text().splitlines()
+    assert [line.split()[0] for line in lines] == ["venv", "pip"]
+    assert str(scratch / ".venv") in lines[0]
+    assert ".tau" not in "\n".join(lines)
+
+
+def test_a_pin_names_the_environment_it_overrode(tmp_path: Path) -> None:
+    """A pin still says which environment it stepped over, so /python is not misleading."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    shared = _make_venv(tmp_path / "home" / ".tau")
+    env = {**_home_env(tmp_path), "TAU_PYTHON": "/opt/side/py/bin/python3"}
+
+    _interpreter, source, report = module.choose_interpreter(env, scratch)
+
+    assert (report.state, report.scope, report.venv_dir) == ("pinned", "shared", shared)
+    assert source == "TAU_PYTHON pin"
+
+
+def test_shared_provisioning_targets_the_shared_environment(tmp_path: Path) -> None:
+    """With no claim on the folder, uv creates `~/.tau/.venv` and installs nothing there."""
+    module = _load_extension()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    early, plan = module._provision_plan(
+        scratch, {**_home_env(tmp_path), "TAU_PY_UV": "/usr/bin/uv"}
+    )
+
+    assert early is None
+    assert plan == [["/usr/bin/uv", "venv", str(tmp_path / "home" / ".tau" / ".venv")]]
 
 
 def test_a_lockfile_goes_through_uv_sync(tmp_path: Path) -> None:
@@ -367,11 +491,15 @@ def test_venv_report_renders_one_status_line() -> None:
 
     assert (
         module.VenvReport("prefer", "missing", None, None).render()
-        == "missing: none at or above cwd (mode=prefer)"
+        == "missing: none at or above cwd (mode=prefer, scope=project)"
     )
     venv_dir = Path("/repo/.venv")
     found = module.VenvReport("prefer", "active", venv_dir, venv_dir / "bin" / "python")
-    assert found.render() == "active: /repo/.venv (mode=prefer)"
+    assert found.render() == "active: /repo/.venv (mode=prefer, scope=project)"
+    shared = module.VenvReport(
+        "prefer", "missing", None, None, "", "shared", Path("/home/u/.tau/.venv")
+    )
+    assert shared.render().startswith("missing: /home/u/.tau/.venv (mode=prefer, scope=shared)")
 
 
 # -- output shape --------------------------------------------------------------

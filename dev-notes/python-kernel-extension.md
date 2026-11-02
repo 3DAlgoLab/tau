@@ -65,39 +65,67 @@ need no `ipykernel`/`jupyter_client` venv build.
 ## Interpreter and environment ladder
 
 ```text
-TAU_PYTHON / PYTOOL_PYTHON / PI_PYTHON pin  →  project .venv  →  PATH python3, python  →  sys.executable
+TAU_PYTHON / PYTOOL_PYTHON / PI_PYTHON pin
+  →  the project's own environment  (.venv, or venv, at or above the cwd)
+  →  the shared environment         (<TAU_HOME>/.venv, i.e. ~/.tau/.venv)
+  →  PATH python3, python
+  →  sys.executable
 ```
 
 `/python` names the interpreter and the rule that picked it, because a failed
 import is an install into *that* interpreter, not a reason to rewrite the cell.
 
-The pin still wins over the venv: `TAU_PYTHON=/path/to/env` stays a one-line
-escape hatch. The middle rung is the newest part, and it exists because a kernel
-booted on Tau's own interpreter installs packages into an environment the
-repository never runs, so every later cell re-imports into the wrong place.
+The pin still wins over both environments: `TAU_PYTHON=/path/to/env` stays a
+one-line escape hatch. The environment rungs exist because a kernel booted on
+Tau's own interpreter installs packages into an environment the session can never
+see again: in a repository it should be the environment the repository runs, and
+outside one it should at least survive the session.
+
+### Project scope or shared scope
+
+`resolve_env_target` decides which environment a cwd belongs to before any
+interpreter is chosen:
+
+- **Project scope** — the cwd, or an ancestor inside the search bound, holds
+  `.venv`, `venv`, `pyproject.toml`, `uv.lock`, or a `requirements*.txt`. That
+  folder owns its Python, so an environment that does not exist yet is still
+  reported against `<cwd>/.venv`: the fix is to create it, not to leave the
+  project. `venv` is accepted alongside `.venv` because plenty of real repos name
+  it that way, and `.venv` still wins when both exist.
+- **Shared scope** — nothing in scope claims the folder. The session then uses one
+  environment under `TAU_HOME` (`~/.tau/.venv` by default) instead of whatever
+  `python3` the shell exposes. A scratch directory gets a stable place to install
+  packages, and the location follows the same `TAU_HOME` rule as the rest of Tau.
+
+The split matters for provisioning as much as for booting: only a project
+environment is ever filled from manifests, so a stray `requirements.txt` in a
+non-project folder cannot push its dependencies into the shared environment.
 
 ### Why the walk is bounded
 
-`find_project_venv` walks up from the session cwd to the nearest `.venv`, but no
-further than the repo root — the nearest ancestor holding `.git` — or, with no
-repo, no further than `$HOME`. Without that bound a stray `~/.venv` becomes the
-kernel for every unrelated project that happens to have no venv of its own, so
-`$HOME`'s own venv counts only when the session actually runs in `$HOME`. A
-`.venv` directory holding no interpreter is reported as `broken` rather than
-quietly replaced by system Python: a half-created venv is a repair job, not a
-fallback.
+`find_project_venv` walks up from the session cwd to the nearest `.venv` or
+`venv`, but no further than the repo root — the nearest ancestor holding `.git` —
+or, with no repo, no further than `$HOME`. Without that bound a stray `~/.venv`
+becomes the kernel for every unrelated project that happens to have no venv of
+its own, so `$HOME`'s own venv counts only when the session actually runs in
+`$HOME`. That is also why the shared environment lives at `~/.tau/.venv` rather
+than `~/.venv`: the shared rung is reached by an explicit rule, never by an
+upward walk that a home-directory venv can hijack. A venv directory holding no
+interpreter is reported as `broken` rather than quietly replaced by system Python:
+a half-created venv is a repair job, not a fallback.
 
 `TAU_PY_VENV` picks the mode:
 
 | Mode | Behavior |
 | --- | --- |
-| `prefer` (default) | use an existing venv; with none, the first cell tells the model how to create one with uv |
-| `require` | provision the venv with uv before the first cell runs |
-| `off` | skip the venv rung entirely (the earlier PATH ladder) |
+| `prefer` (default) | use an existing environment; with none, the first cell names the exact uv command that creates it |
+| `require` | provision the resolved environment with uv before the first cell runs |
+| `off` | skip both environment rungs entirely (the earlier PATH ladder) |
 
 The outcome is one state word — `active`, `missing`, `broken`, `pinned`, `off` —
-shown by `/python` and carried in each cell result's `details.venvState` so
-renderers and tests can see it without parsing text.
+plus the scope (`project` or `shared`), shown by `/python` and carried in each
+cell result's `details.venvState` so renderers and tests can see it without
+parsing text.
 
 ### Provisioning stays uv's job
 
@@ -111,7 +139,10 @@ step is read from the project's own manifests:
 - only `requirements*.txt` present → `uv pip install --python <venv python> -r <file>`,
   which fills the venv without touching the project's own metadata.
 - `pyproject.toml` without a lock → `uv sync`.
-- nothing → create the venv and stop.
+- nothing → create the environment and stop.
+
+In shared scope only the first step runs: the shared environment belongs to no
+repository, so no manifest of the cwd is ever installed into it.
 
 An existing interpreter is reused unless `--force` is passed; uv is located via
 `TAU_PY_UV` then PATH; a missing uv is reported as `uv missing` with the fallback
@@ -147,9 +178,10 @@ is the one failure mode this extension cannot recover from afterwards.
 
 | Variable | Effect |
 | --- | --- |
-| `TAU_PYTHON` (or `PYTOOL_PYTHON`, `PI_PYTHON`) | pin the interpreter, trusted without probing; wins over the venv |
-| `TAU_PY_VENV` | `prefer` (default), `require`, or `off` for the project-venv rung |
-| `TAU_PY_UV` | pin the uv binary used to provision a venv (else PATH) |
+| `TAU_PYTHON` (or `PYTOOL_PYTHON`, `PI_PYTHON`) | pin the interpreter, trusted without probing; wins over both environments |
+| `TAU_PY_VENV` | `prefer` (default), `require`, or `off` for the project/shared environment rungs |
+| `TAU_PY_UV` | pin the uv binary used to provision an environment (else PATH) |
+| `TAU_HOME` | moves the shared environment (default `~/.tau`, so `~/.tau/.venv`) |
 | `TAU_PY_CELL_TIMEOUT_MS` | default per-cell wall clock; `0` (off) by default |
 | `TAU_PY_ABORT_GRACE_MS` | grace before an aborted cell's kernel is reaped (`5000`) |
 | `TAU_PY_MAX_OUTPUT_CHARS` | per-cell output cap (`46080`) |

@@ -118,7 +118,8 @@ synced from `~/.tau/extensions/python_kernel.py` (+353/−28), and that sync is 
 They are **no longer byte-identical** (checked 2026-11-03), but the entire delta is formatting: two
 `choose_interpreter` return statements re-wrapped by `ruff format` in `examples/` (8 lines there, 4
 installed). Same semantics, so the live copy is not running older logic; re-installing it would be
-cosmetic.
+cosmetic. That drift is gone: the shared-environment change below was installed with
+`tau install --force`, so `~/.tau/extensions/python_kernel.py` is again a copy of `examples/`.
 
 - Behavior: interpreter ladder is now `pin → project .venv → PATH → sys.executable`.
   The `.venv` walk is bounded by the git root, else `$HOME`. `TAU_PY_VENV=prefer|require|off`,
@@ -137,6 +138,38 @@ cosmetic.
 - Commit boundary: `abdd490` (stall guard), `a6dc016` (python kernel) and `81ff167` (the venv rung:
   extension + tests + docs, one commit) are on `main`, pushed to `origin`. The earlier "not
   committed yet" and "blocked on the test port" notes are stale.
+
+### Shared environment outside a project
+
+The ladder is now:
+
+```text
+pin  →  project env (.venv or venv at/above cwd)  →  <TAU_HOME>/.venv  →  PATH  →  sys.executable
+```
+
+- **Scope rule.** A folder claims its own Python with `.venv`, `venv`, `pyproject.toml`,
+  `uv.lock`, or a `requirements*.txt` (anywhere in the bounded walk). `venv` is now found
+  beside `.venv`, `.venv` first. A folder that claims a project but has no environment yet
+  stays in project scope: the hint and uv target are `<cwd>/.venv`, not the shared env.
+- **Shared env.** With no marker in scope the kernel uses `<TAU_HOME>/.venv`
+  (`~/.tau/.venv`), so a scratch cwd gets a durable environment instead of whatever
+  `python3` PATH holds — here that was a linuxbrew interpreter. It is created by
+  `/python venv` or `TAU_PY_VENV=require`, never silently, and no manifest from the cwd is
+  ever installed into it.
+- **Shape.** `resolve_env_target` returns an `EnvTarget` (`venv_dir`, `interpreter`, `scope`,
+  `create_dir`) and is shared by `choose_interpreter` and `_provision_plan`, so the resolver
+  and the provisioner cannot drift. `VenvReport` gained `scope` and `create_dir`; `/python`
+  renders `active: /home/j2y/.tau/.venv (mode=prefer, scope=shared)`.
+- **Host side:** `~/.tau/.venv` was created with `uv venv --python 3.13` (3.13.12, matching the
+  packaged Tau), and the example was reinstalled with `tau install --force`.
+- **Deviation to note:** the ask named `.venv`, `venv`, and `pyproject.toml`; `uv.lock` and
+  `requirements*.txt` were added as markers because a folder holding only a requirements file
+  would otherwise have its dependencies installed into the shared environment, and
+  `test_uv_provisions_a_working_project_venv` encodes the project behavior for exactly that
+  folder.
+- Checks: `ruff check` / `ruff format --check` clean; `uv run mypy` clean (124 files, `src/` only);
+  `uv run pytest tests/test_python_kernel_extension.py -q` → 41 passed (8 new); full
+  `TZ=UTC uv run pytest -q` → 2273 passed, 3 skipped.
 
 ### Deliberate deviations from pi-pytool
 

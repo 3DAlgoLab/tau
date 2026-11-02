@@ -838,10 +838,11 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
   stays alive for the session, so imports, data, and live handles carry between
   cells; cells are capped, cut by an optional deadline (interrupt, then kill),
   and `/python` reports or resets the kernel. The kernel boots the project's own
-  `.venv` — the nearest one at or above the cwd, bounded by the repo root — so
-  packages the agent installs land in the environment the repository actually
-  runs; `TAU_PY_VENV=prefer|require|off` tunes that and `/python venv` creates
-  the venv with uv.
+  environment — `.venv` or `venv`, the nearest one at or above the cwd, bounded by
+  the repo root — and falls back to one shared environment at `~/.tau/.venv` when
+  the folder holds no `.venv`, `venv`, or `pyproject.toml`, so packages the agent
+  installs land in an environment the session can reuse; `TAU_PY_VENV=prefer|require|off`
+  tunes that and `/python venv` creates the environment with uv.
 - **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
 - **`web_search.py`** — adds `web_search` (ranked results, optional synthesized
   answer) and `web_fetch` (reader-mode page text, paged by `offset`), plus
