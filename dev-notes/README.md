@@ -38,8 +38,9 @@ User-facing documentation lives in `website/content/` and is published at
   turn that ended with no tool call, and why inline agent-event dispatch makes a
   queued follow-up continue the same run.
 - `python-kernel-extension.md` — how the shipped `python_kernel` example keeps one
-  live interpreter per session, and why its interrupt ladder is SIGINT-then-kill
-  instead of a Jupyter control channel.
+  live interpreter per session, why its interrupt ladder is SIGINT-then-kill
+  instead of a Jupyter control channel, and why that interpreter is the project's
+  own `.venv` rather than whatever Python Tau happens to run on.
 - `tui-latency-fixes.md` — profiled causes of slow prompt echo and startup, and
   the stamp-validated caches and scheduling changes that fixed them.
 

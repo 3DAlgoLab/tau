@@ -837,7 +837,11 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
 - **`python_kernel.py`** — adds a `python` tool backed by one interpreter that
   stays alive for the session, so imports, data, and live handles carry between
   cells; cells are capped, cut by an optional deadline (interrupt, then kill),
-  and `/python` reports or resets the kernel.
+  and `/python` reports or resets the kernel. The kernel boots the project's own
+  `.venv` — the nearest one at or above the cwd, bounded by the repo root — so
+  packages the agent installs land in the environment the repository actually
+  runs; `TAU_PY_VENV=prefer|require|off` tunes that and `/python venv` creates
+  the venv with uv.
 - **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
 
 A larger, real-world extension lives in its own repository:

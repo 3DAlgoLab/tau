@@ -20,6 +20,14 @@ than cosmetic:
 * No namespace snapshots: handles cannot be pickled, so a rebuilt kernel starts
   empty and says so out loud.
 
+Interpreter choice: the kernel runs the *project's* virtualenv -- `<cwd>/.venv`,
+or the nearest one at or above cwd, bounded by the repo root (or `$HOME`) so a
+stray `~/.venv` cannot hijack an unrelated project. That keeps the packages the
+agent installs in the environment the repository actually runs. Modes, via
+`TAU_PY_VENV`: `prefer` (default) uses an existing venv and tells the model to
+create the missing one with uv; `require` provisions it with uv before the first
+cell; `off` restores plain PATH lookup. `TAU_PYTHON` still pins outright.
+
 Install by copying into `~/.tau/extensions/`, or run:
 
     tau -e examples/extensions/python_kernel.py
@@ -32,6 +40,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Mapping
 from contextlib import suppress
@@ -63,6 +72,13 @@ DEFAULT_ABORT_GRACE_MS = 5_000
 DEFAULT_CELL_TIMEOUT_MS = 0
 BOOT_TIMEOUT_SECONDS = 90.0
 REAP_WAIT_SECONDS = 2.0
+
+# Project-venv resolution and uv provisioning.
+VENV_DIR_NAME = ".venv"
+DEFAULT_VENV_MODE = "prefer"
+VENV_MODES = ("off", "prefer", "require")
+REQUIREMENTS_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-test.txt")
+PROVISION_TIMEOUT_SECONDS = 300.0
 
 REAPED_NOTICE = (
     "<tau_python_kernel_reaped> the cell ignored the interrupt, so the kernel was "
@@ -267,6 +283,23 @@ class KernelGone(RuntimeError):
 
 
 @dataclass(frozen=True)
+class VenvReport:
+    """What the project-venv rule saw under this cwd, and what it decided."""
+
+    mode: str  # off | prefer | require
+    state: str  # active | missing | broken | pinned | off
+    venv_dir: Path | None = None
+    interpreter: Path | None = None
+    note: str = ""
+
+    def render(self) -> str:
+        """Render one status line for /python and for cell output."""
+        where = str(self.venv_dir) if self.venv_dir is not None else "none at or above cwd"
+        tail = f" -- {self.note}" if self.note else ""
+        return f"{self.state}: {where} (mode={self.mode}){tail}"
+
+
+@dataclass(frozen=True)
 class KernelSettings:
     """Resolved configuration for one kernel."""
 
@@ -276,6 +309,7 @@ class KernelSettings:
     line_chars: int
     cell_timeout_ms: int
     abort_grace_ms: int
+    venv: VenvReport
 
 
 @dataclass
@@ -303,22 +337,119 @@ def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
         return default
 
 
-def resolve_interpreter(env: Mapping[str, str]) -> tuple[str, str]:
-    """Pick the interpreter and name the rule that picked it."""
+def _venv_python(venv_dir: Path) -> Path:
+    """Return the interpreter path inside a virtualenv, per-OS."""
+    return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _git_root(cwd: Path) -> Path | None:
+    """Return the nearest ancestor holding `.git`, if any."""
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _venv_search_bound(cwd: Path, home: Path | None) -> Path:
+    """Bound the upward walk at the repo root, or at $HOME, never further.
+
+    Without a bound a stray `~/.venv` would become the kernel for every project
+    that has no venv of its own.
+    """
+    root = _git_root(cwd)
+    if root is not None:
+        return root
+    if home is not None and (home == cwd or home in cwd.parents):
+        return home
+    return cwd
+
+
+def find_project_venv(cwd: Path, env: Mapping[str, str]) -> tuple[Path | None, Path | None]:
+    """Return ``(venv_dir, interpreter)`` for the nearest `.venv` at or above cwd.
+
+    ``interpreter`` is None when the directory exists but holds no usable
+    interpreter; the caller reports that as a broken venv instead of quietly
+    falling back to the system python.
+    """
+    home_raw = (env.get("HOME") or "").strip()
+    if not home_raw and os.name != "nt":
+        home_raw = os.path.expanduser("~")
+    home = Path(home_raw) if home_raw else None
+    bound = _venv_search_bound(cwd, home)
+    current = cwd
+    while True:
+        # $HOME's own venv only counts when the session actually runs in $HOME.
+        if not (home is not None and current == home and cwd != home):
+            candidate = current / VENV_DIR_NAME
+            if candidate.is_dir():
+                python = _venv_python(candidate)
+                return candidate, (python if python.is_file() else None)
+        if current == bound or current.parent == current:
+            return None, None
+        current = current.parent
+
+
+def uv_binary(env: Mapping[str, str]) -> str | None:
+    """Locate uv: an explicit `TAU_PY_UV` pin first, then PATH."""
+    pinned = (env.get("TAU_PY_UV") or "").strip()
+    return pinned or shutil.which("uv", path=env.get("PATH"))
+
+
+def choose_interpreter(env: Mapping[str, str], cwd: Path) -> tuple[str, str, VenvReport]:
+    """Pick the interpreter and name the rule that picked it.
+
+    Order: an explicit pin, then the project `.venv`, then PATH, then Tau's own
+    interpreter. A pin wins over the venv so `TAU_PYTHON=/path/to/env` stays a
+    one-line escape hatch; `TAU_PY_VENV` tunes the venv rule itself.
+    """
+    mode = (env.get("TAU_PY_VENV") or DEFAULT_VENV_MODE).strip().lower()
+    if mode not in VENV_MODES:
+        mode = DEFAULT_VENV_MODE
+    venv_dir, venv_python = find_project_venv(cwd, env)
+
     for variable in ("TAU_PYTHON", "PYTOOL_PYTHON", "PI_PYTHON"):
-        pinned = env.get(variable)
-        if pinned and pinned.strip():
-            return pinned.strip(), f"{variable} pin"
+        pinned = (env.get(variable) or "").strip()
+        if pinned:
+            note = (
+                f"{venv_dir} ignored because {variable} pins the interpreter"
+                if mode != "off" and venv_dir is not None
+                else ""
+            )
+            return (
+                pinned,
+                f"{variable} pin",
+                VenvReport(mode, "pinned", venv_dir, venv_python, note),
+            )
+
+    if mode == "off":
+        state = "off"
+    elif venv_dir is None:
+        state = "missing"
+    else:
+        state = "active" if venv_python is not None else "broken"
+
+    if state == "active" and venv_python is not None:
+        return (
+            str(venv_python),
+            f"project venv {venv_dir}",
+            VenvReport(mode, state, venv_dir, venv_python),
+        )
+
+    note = ""
+    if state == "broken":
+        note = f"{venv_dir} holds no interpreter; recreate it with `uv venv`"
+    elif state == "missing" and mode == "require":
+        note = "uv will create it before the first cell"
     for name in ("python3", "python"):
         found = shutil.which(name, path=env.get("PATH"))
         if found:
-            return found, f"PATH {name}"
-    return sys.executable, "tau interpreter"
+            return found, f"PATH {name}", VenvReport(mode, state, venv_dir, venv_python, note)
+    return sys.executable, "tau interpreter", VenvReport(mode, state, venv_dir, venv_python, note)
 
 
-def settings_from_env(env: Mapping[str, str]) -> KernelSettings:
-    """Build kernel settings from the process environment."""
-    interpreter, source = resolve_interpreter(env)
+def settings_from_env(env: Mapping[str, str], cwd: Path) -> KernelSettings:
+    """Build kernel settings for one cwd from the process environment."""
+    interpreter, source, venv = choose_interpreter(env, cwd)
     return KernelSettings(
         interpreter=interpreter,
         interpreter_source=source,
@@ -326,7 +457,141 @@ def settings_from_env(env: Mapping[str, str]) -> KernelSettings:
         line_chars=_env_int(env, "TAU_PY_LINE_CHARS", DEFAULT_LINE_CHARS),
         cell_timeout_ms=_env_int(env, "TAU_PY_CELL_TIMEOUT_MS", DEFAULT_CELL_TIMEOUT_MS),
         abort_grace_ms=_env_int(env, "TAU_PY_ABORT_GRACE_MS", DEFAULT_ABORT_GRACE_MS),
+        venv=venv,
     )
+
+
+@dataclass
+class ProvisionReport:
+    """What uv did (or refused to do) for the project venv."""
+
+    ok: bool
+    state: str
+    actions: list[str] = field(default_factory=list)
+    log: str = ""
+
+    def render(self) -> str:
+        """Render the outcome as one line, plus uv's output when there was any."""
+        steps = "; ".join(self.actions) if self.actions else "no steps run"
+        head = f"venv: {self.state} -- {steps}"
+        return f"{head}\n{self.log}" if self.log else head
+
+
+def provision_steps(venv_dir: Path, cwd: Path) -> list[list[str]]:
+    """Plan the uv commands that fill a project venv from its manifests.
+
+    A lockfile means the project owns its resolution, so `uv sync` is the right
+    call; with only requirements files, install those into the venv directly and
+    leave the project's own metadata untouched.
+    """
+    python = str(_venv_python(venv_dir))
+    if (cwd / "uv.lock").is_file():
+        return [["uv", "sync"]]
+    requirements = [name for name in REQUIREMENTS_FILES if (cwd / name).is_file()]
+    if requirements:
+        return [["uv", "pip", "install", "--python", python, "-r", name] for name in requirements]
+    if (cwd / "pyproject.toml").is_file():
+        return [["uv", "sync"]]
+    return []
+
+
+def _provision_plan(
+    cwd: Path, env: Mapping[str, str], *, force: bool = False
+) -> tuple[ProvisionReport | None, list[list[str]]]:
+    """Shared front end for both runners: reuse, refuse, or lay out the uv argvs."""
+    venv_dir, venv_python = find_project_venv(cwd, env)
+    if not force and venv_python is not None:
+        return ProvisionReport(True, "reused", [f"reused {venv_python}"]), []
+    uv = uv_binary(env)
+    if uv is None:
+        return (
+            ProvisionReport(
+                False,
+                "uv missing",
+                [],
+                "uv is not on PATH: install uv, or pin TAU_PYTHON to an existing interpreter",
+            ),
+            [],
+        )
+    target = venv_dir or (cwd / VENV_DIR_NAME)
+    argvs = [["uv", "venv", str(target)], *provision_steps(target, cwd)]
+    return None, [[uv, *argv[1:]] for argv in argvs]
+
+
+def _provision_report(actions: list[str], log: list[str], failed: bool) -> ProvisionReport:
+    """Close out one provisioning run."""
+    if failed:
+        return ProvisionReport(False, "failed", actions, "\n".join(log))
+    return ProvisionReport(
+        True, "reused" if not actions else "provisioned", actions, "\n".join(log)
+    )
+
+
+def provision_venv_sync(
+    cwd: Path, env: Mapping[str, str], *, force: bool = False
+) -> ProvisionReport:
+    """Create/refresh `<project>/.venv` with uv, blocking (`/python venv`)."""
+    early, plan = _provision_plan(cwd, env, force=force)
+    if early is not None:
+        return early
+    actions: list[str] = []
+    log: list[str] = []
+    for argv in plan:
+        shown = " ".join(argv)
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=PROVISION_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.append(f"$ {shown} -> {exc}")
+            return _provision_report(actions, log, True)
+        if completed.returncode != 0:
+            log.append(
+                f"$ {shown} -> exit {completed.returncode}\n{(completed.stderr or '').strip()}"
+            )
+            return _provision_report(actions, log, True)
+        actions.append(" ".join(argv[1:]))
+    return _provision_report(actions, log, False)
+
+
+async def provision_venv(
+    cwd: Path, env: Mapping[str, str], *, force: bool = False
+) -> ProvisionReport:
+    """Async twin of `provision_venv_sync` so the first cell never blocks the UI."""
+    early, plan = _provision_plan(cwd, env, force=force)
+    if early is not None:
+        return early
+    actions: list[str] = []
+    log: list[str] = []
+    for argv in plan:
+        shown = " ".join(argv)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await asyncio.wait_for(
+                process.communicate(), PROVISION_TIMEOUT_SECONDS
+            )
+        except (OSError, TimeoutError) as exc:
+            log.append(f"$ {shown} -> {exc}")
+            return _provision_report(actions, log, True)
+        if process.returncode != 0:
+            log.append(
+                f"$ {shown} -> exit {process.returncode}"
+                f"\n{(stderr or b'').decode('utf-8', 'replace').strip()}"
+            )
+            return _provision_report(actions, log, True)
+        actions.append(" ".join(argv[1:]))
+    return _provision_report(actions, log, False)
 
 
 def clip_line(line: str, line_chars: int) -> str:
@@ -691,16 +956,52 @@ def _render_result(result: AgentToolResult, *, expanded: bool) -> str | None:
 
 def setup(tau: ExtensionAPI) -> None:
     """Register the kernel tool, its transcript renderer, and its status command."""
-    settings = settings_from_env(os.environ)
-    kernel: PythonKernel | None = None
     cwd = Path.cwd()
+    settings = settings_from_env(os.environ, cwd)
+    kernel: PythonKernel | None = None
+    venv_hint_shown = False
 
-    def ensure_kernel() -> PythonKernel:
-        """Return the session kernel, building it on first use."""
-        nonlocal kernel
+    def ensure_kernel() -> tuple[PythonKernel, str]:
+        """Return the session kernel plus a note when the interpreter just moved.
+
+        Resolution happens per call, not once at setup: the session cwd arrives
+        after `setup` runs, and the project venv can appear mid-session (the
+        agent creates it with uv). When the answer changes, the kernel restarts
+        rather than pretending a name still lives in the old environment.
+        """
+        nonlocal kernel, settings
+        fresh = settings_from_env(os.environ, cwd)
+        note = ""
+        if kernel is not None and kernel.settings.interpreter != fresh.interpreter:
+            if kernel.state != "stopped":
+                note = (
+                    f"kernel moved {kernel.settings.interpreter} -> {fresh.interpreter} "
+                    f"({fresh.interpreter_source}); namespace reset."
+                )
+            kernel.shutdown_now()
+            kernel = None
+        settings = fresh
         if kernel is None:
             kernel = PythonKernel(settings, cwd)
-        return kernel
+        return kernel, note
+
+    async def venv_bootstrap() -> str:
+        """Provision the project venv in `require` mode, or hint once in `prefer`."""
+        nonlocal venv_hint_shown
+        if settings.venv.state in ("active", "pinned", "off"):
+            return ""
+        if settings.venv.mode == "require":
+            report = await provision_venv(cwd, os.environ)
+            if report.ok:
+                return report.render()
+            return f"{report.render()}\nvenv: falling back to {settings.interpreter}"
+        if not venv_hint_shown:
+            venv_hint_shown = True
+            return (
+                f"venv: {settings.venv.render()} -- create it with `uv venv && uv pip install "
+                "-r requirements.txt` (or `uv sync`) and the next cell runs inside it."
+            )
+        return ""
 
     async def execute_python(
         tool_call_id: str,
@@ -713,7 +1014,10 @@ def setup(tau: ExtensionAPI) -> None:
         code = str(arguments.get("code", ""))
         max_chars = arguments.get("maxOutputChars")
         timeout_ms = arguments.get("timeoutMs")
-        active = ensure_kernel()
+        notes = [note for note in [await venv_bootstrap()] if note]
+        active, moved = ensure_kernel()
+        if moved:
+            notes.append(moved)
         limit = settings.max_output_chars
         if isinstance(max_chars, int) and max_chars > 0:
             limit = max_chars
@@ -728,6 +1032,7 @@ def setup(tau: ExtensionAPI) -> None:
                 "status": "error",
                 "names": [],
                 "interpreter": settings.interpreter,
+                "venvState": settings.venv.state,
                 "stdoutChars": 0,
                 "stderrChars": 0,
             }
@@ -735,7 +1040,8 @@ def setup(tau: ExtensionAPI) -> None:
                 "status: error\n"
                 f"error: cannot start the kernel at {settings.interpreter} "
                 f"(picked by {settings.interpreter_source})\n{exc}\n"
-                "Set TAU_PYTHON to a working interpreter, or run /python to see what was picked."
+                "Set TAU_PYTHON to a working interpreter, create the project venv with `uv venv`, "
+                "or run /python to see what was picked."
             )
             return AgentToolResult(content=[TextContent(text=text)], details=details)
         details = {
@@ -744,6 +1050,7 @@ def setup(tau: ExtensionAPI) -> None:
             "reaped": outcome.reaped,
             "names": list(outcome.names),
             "interpreter": active.settings.interpreter,
+            "venvState": active.settings.venv.state,
             "stdoutChars": len(outcome.stdout),
             "stderrChars": len(outcome.stderr),
         }
@@ -752,6 +1059,8 @@ def setup(tau: ExtensionAPI) -> None:
             limit,
             settings.line_chars,
         )
+        if notes:
+            text = "\n".join([*notes, text])
         return AgentToolResult(content=[TextContent(text=text)], details=details)
 
     tau.register_tool(
@@ -766,9 +1075,10 @@ def setup(tau: ExtensionAPI) -> None:
                 "starts cold and keeps nothing. A cell that raises keeps the kernel and its "
                 f"namespace; a cell that ignores an interrupt has its kernel killed, which empties "
                 f"the namespace and is reported as reaped. Output is capped at "
-                f"{settings.max_output_chars} chars per cell with an explicit marker. One "
-                "interpreter runs the kernel, named by /python, and a failed import means "
-                "installing into that interpreter."
+                f"{settings.max_output_chars} chars per cell with an explicit marker. The kernel "
+                "runs the project's own `.venv` (nearest one at or above the cwd) so installed "
+                "packages land where the repository runs; a failed import means installing into "
+                "that environment, and /python names the interpreter."
             ),
             parameters={
                 "type": "object",
@@ -798,6 +1108,10 @@ def setup(tau: ExtensionAPI) -> None:
                 "re-importing, reloading or recomputing them.",
                 "Look before acting: print the minimal view that answers the question. The last "
                 "expression's value comes back on its own.",
+                "The kernel prefers the project's `.venv`. If a cell reports `venv: missing` or "
+                "`venv: broken`, create or repair it in bash with `uv venv` plus `uv sync` or "
+                "`uv pip install -r requirements.txt`; the next cell moves into it and says the "
+                "namespace was reset. Never delete a working `.venv`.",
                 "Drive blocking APIs (RPC, COM, sockets) as many short calls, never one long "
                 "batch: an interrupt cannot cut a call parked inside C, and the only way back is "
                 "killing the kernel and losing every name and handle.",
@@ -815,9 +1129,10 @@ def setup(tau: ExtensionAPI) -> None:
     @tau.on("session_start")
     def on_session_start(event: object, context: ExtensionContext) -> None:
         """Bind the kernel to this session's directory and drop any inherited one."""
-        nonlocal kernel, cwd
+        nonlocal kernel, cwd, settings
         del event
         cwd = context.cwd
+        settings = settings_from_env(os.environ, cwd)
         if kernel is not None:
             kernel.shutdown_now()
             kernel = None
@@ -832,16 +1147,28 @@ def setup(tau: ExtensionAPI) -> None:
             kernel = None
 
     def handle_status(args: str, context: ExtensionCommandContext) -> str:
-        """Report interpreter, processes, caps, and the live namespace."""
+        """Report interpreter, venv, processes, caps, and the live namespace."""
         del context
-        active = ensure_kernel()
-        if args.strip() == "reset":
+        request = args.strip().lower()
+        if request.startswith("venv"):
+            report = provision_venv_sync(cwd, os.environ, force="--force" in request)
+            after = settings_from_env(os.environ, cwd)
+            return "\n".join(
+                [
+                    report.render(),
+                    f"kernel resolves to: {after.interpreter} ({after.interpreter_source})",
+                    "the next cell boots the kernel there",
+                ]
+            )
+        active, moved = ensure_kernel()
+        if request == "reset":
             active.shutdown_now()
             return f"python: kernel stopped; the next cell boots a fresh, empty one at {cwd}"
         pid = active.pid
         lines = [
             f"kernel: {active.state}" + (f" \u00b7 pid {pid}" if pid is not None else ""),
             f"python: {active.settings.interpreter} ({active.settings.interpreter_source})",
+            f"venv: {active.settings.venv.render()}",
             f"cwd: {cwd}",
             f"output cap: {active.settings.max_output_chars} chars per cell, "
             f"{active.settings.line_chars} per line",
@@ -850,11 +1177,13 @@ def setup(tau: ExtensionAPI) -> None:
             f"namespace: {format_names(active.names)}",
             "no snapshots: a rebuilt kernel starts empty",
         ]
+        if moved:
+            lines.insert(0, moved)
         return "\n".join(lines)
 
     tau.register_command(
         COMMAND_NAME,
         handle_status,
-        description="Show or reset the persistent Python kernel",
-        usage="[reset]",
+        description="Show, reset, or provision the persistent Python kernel's environment",
+        usage="[reset|venv [--force]]",
     )

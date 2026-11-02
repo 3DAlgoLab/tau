@@ -62,14 +62,69 @@ Pi interrupts through Jupyter's ZMQ control channel; this port sends SIGINT
 directly. Same guarantee, same failure mode, one less dependency: Tau installs
 need no `ipykernel`/`jupyter_client` venv build.
 
-## Interpreter ladder
+## Interpreter and environment ladder
 
 ```text
-TAU_PYTHON / PYTOOL_PYTHON / PI_PYTHON pin  →  PATH python3, python  →  sys.executable
+TAU_PYTHON / PYTOOL_PYTHON / PI_PYTHON pin  →  project .venv  →  PATH python3, python  →  sys.executable
 ```
 
 `/python` names the interpreter and the rule that picked it, because a failed
 import is an install into *that* interpreter, not a reason to rewrite the cell.
+
+The pin still wins over the venv: `TAU_PYTHON=/path/to/env` stays a one-line
+escape hatch. The middle rung is the newest part, and it exists because a kernel
+booted on Tau's own interpreter installs packages into an environment the
+repository never runs, so every later cell re-imports into the wrong place.
+
+### Why the walk is bounded
+
+`find_project_venv` walks up from the session cwd to the nearest `.venv`, but no
+further than the repo root — the nearest ancestor holding `.git` — or, with no
+repo, no further than `$HOME`. Without that bound a stray `~/.venv` becomes the
+kernel for every unrelated project that happens to have no venv of its own, so
+`$HOME`'s own venv counts only when the session actually runs in `$HOME`. A
+`.venv` directory holding no interpreter is reported as `broken` rather than
+quietly replaced by system Python: a half-created venv is a repair job, not a
+fallback.
+
+`TAU_PY_VENV` picks the mode:
+
+| Mode | Behavior |
+| --- | --- |
+| `prefer` (default) | use an existing venv; with none, the first cell tells the model how to create one with uv |
+| `require` | provision the venv with uv before the first cell runs |
+| `off` | skip the venv rung entirely (the earlier PATH ladder) |
+
+The outcome is one state word — `active`, `missing`, `broken`, `pinned`, `off` —
+shown by `/python` and carried in each cell result's `details.venvState` so
+renderers and tests can see it without parsing text.
+
+### Provisioning stays uv's job
+
+`provision_venv` (async, ahead of the first cell in `require` mode) and
+`provision_venv_sync` (`/python venv`, sync because command handlers cannot
+await) share one plan builder. `uv venv <dir>` comes first, and the dependency
+step is read from the project's own manifests:
+
+- `uv.lock` present → `uv sync`, because a lockfile means the project owns its
+  resolution.
+- only `requirements*.txt` present → `uv pip install --python <venv python> -r <file>`,
+  which fills the venv without touching the project's own metadata.
+- `pyproject.toml` without a lock → `uv sync`.
+- nothing → create the venv and stop.
+
+An existing interpreter is reused unless `--force` is passed; uv is located via
+`TAU_PY_UV` then PATH; a missing uv is reported as `uv missing` with the fallback
+named rather than guessed around; each uv step gets its own 300 s budget.
+
+### Resolution happens per cell, not at setup
+
+The session cwd arrives after `setup` runs, and the agent may create `.venv`
+mid-session — that is the whole point of the `prefer` hint. So every cell
+re-resolves, and if the answer moved the kernel is shut down and rebuilt with a
+`kernel moved … namespace reset.` line prepended to the result. Restarting is
+deliberate: pretending a name still lives in the environment the kernel just left
+is the one failure mode this extension cannot recover from afterwards.
 
 ## Tau APIs used
 
@@ -78,19 +133,23 @@ import is an install into *that* interpreter, not a reason to rewrite the cell.
 - `render_call`/`render_result` keep the transcript to one line per cell;
   `prompt_guidelines` carries the usage rules (reuse names, many short calls for
   blocking APIs, treat a reset notice as a dead namespace, never compute through
-  `bash`).
+  `bash`, repair a `venv: missing|broken` in `bash` with uv instead of deleting
+  it or piping Python through the shell).
 - `session_start` re-binds the kernel to the session cwd and drops any inherited
   one (`/new`, `/fork`, `/reload`); `session_shutdown` stops the process so no
   interpreter is left holding handles after Tau exits.
 - `tau.register_command("python", ...)` gives read-only diagnostics plus
-  `reset`; command handlers are sync-only, so the reset path terminates the
-  process without awaiting the loop.
+  `reset` and `venv [--force]`; command handlers are sync-only, so both the reset
+  path and the provisioning path run without awaiting the loop
+  (`provision_venv_sync` rather than the async twin the first cell uses).
 
 ## Configuration
 
 | Variable | Effect |
 | --- | --- |
-| `TAU_PYTHON` (or `PYTOOL_PYTHON`, `PI_PYTHON`) | pin the interpreter, trusted without probing |
+| `TAU_PYTHON` (or `PYTOOL_PYTHON`, `PI_PYTHON`) | pin the interpreter, trusted without probing; wins over the venv |
+| `TAU_PY_VENV` | `prefer` (default), `require`, or `off` for the project-venv rung |
+| `TAU_PY_UV` | pin the uv binary used to provision a venv (else PATH) |
 | `TAU_PY_CELL_TIMEOUT_MS` | default per-cell wall clock; `0` (off) by default |
 | `TAU_PY_ABORT_GRACE_MS` | grace before an aborted cell's kernel is reaped (`5000`) |
 | `TAU_PY_MAX_OUTPUT_CHARS` | per-cell output cap (`46080`) |
@@ -111,6 +170,15 @@ arrive as replacement characters). The wiring tests drive a real `CodingSession`
 with `FakeProvider` and assert that a name defined in one turn is readable in
 the next turn's cell.
 
+The venv rung is not covered by the shipped suite yet, and the existing
+interpreter-ladder tests still call the pre-venv `resolve_interpreter(env)` /
+`settings_from_env(env)` signatures, so they fail against this revision until
+they are re-pointed at `choose_interpreter(env, cwd)` and
+`settings_from_env(env, cwd)`. The cases worth pinning, in order of how badly
+they would bite: the ancestor walk and its repo/`$HOME` bound, a `$HOME` venv
+refusing to hijack a project, a broken venv reported rather than bypassed, the
+uv plan per manifest kind, and reuse-vs-rebuild on a second run.
+
 ## Limits and likely follow-ups
 
 - Output is buffered per cell, not streamed; a long-running cell is silent
@@ -124,3 +192,10 @@ the next turn's cell.
 - Ported from Pi but not yet implemented here: the import-hint (naming the pip
   command for a missing package) and the `bash`-pushback hook that warns when
   Python is routed through the shell instead of the kernel.
+- Venv provisioning only knows uv. A project pinned to pip/pip-tools gets a
+  working `uv venv` plus a `uv pip install -r` translation, which is usually
+  right, but there is no path yet for projects whose setup depends on a specific
+  installer (an editable install with build requirements, for instance).
+- `/python venv` blocks the TUI while uv runs. The cell path is async; the
+  command path is sync because the extension API's command handlers are, so a
+  progress event would have to come from a different seam.

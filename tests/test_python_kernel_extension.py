@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -49,13 +50,13 @@ def _load_extension() -> ModuleType:
     return module
 
 
-def _settings(module: ModuleType, **overrides: str) -> Any:
-    return module.settings_from_env({"TAU_PYTHON": sys.executable, **overrides})
+def _settings(module: ModuleType, cwd: Path, **overrides: str) -> Any:
+    return module.settings_from_env({"TAU_PYTHON": sys.executable, **overrides}, cwd)
 
 
 @asynccontextmanager
 async def _kernel(module: ModuleType, tmp_path: Any, **overrides: str) -> AsyncIterator[Any]:
-    kernel = module.PythonKernel(_settings(module, **overrides), tmp_path)
+    kernel = module.PythonKernel(_settings(module, tmp_path, **overrides), tmp_path)
     try:
         yield kernel
     finally:
@@ -91,18 +92,21 @@ async def _load_session(tmp_path: Any, provider: FakeProvider) -> CodingSession:
 # -- configuration -------------------------------------------------------------
 
 
-def test_interpreter_ladder_prefers_an_explicit_pin() -> None:
+def test_interpreter_ladder_prefers_an_explicit_pin(tmp_path: Any) -> None:
     module = _load_extension()
-    resolved, rule = module.resolve_interpreter(
-        {"TAU_PYTHON": "/opt/side/py/bin/python3", "PATH": "/usr/bin"}
+    resolved, rule, report = module.choose_interpreter(
+        {"TAU_PYTHON": "/opt/side/py/bin/python3", "PATH": "/usr/bin"}, tmp_path
     )
 
     assert (resolved, rule) == ("/opt/side/py/bin/python3", "TAU_PYTHON pin")
+    assert report.state == "pinned"
 
 
 def test_interpreter_ladder_uses_a_path_interpreter_before_taus_own(tmp_path: Any) -> None:
     module = _load_extension()
-    resolved, rule = module.resolve_interpreter({"PATH": str(Path(sys.executable).parent)})
+    resolved, rule, _report = module.choose_interpreter(
+        {"PATH": str(Path(sys.executable).parent)}, tmp_path
+    )
 
     assert rule.startswith("PATH")
     assert Path(resolved).parent == Path(sys.executable).parent
@@ -112,12 +116,12 @@ def test_interpreter_ladder_falls_back_to_the_tau_interpreter(tmp_path: Any) -> 
     module = _load_extension()
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
-    resolved, rule = module.resolve_interpreter({"PATH": str(empty_bin)})
+    resolved, rule, _report = module.choose_interpreter({"PATH": str(empty_bin)}, tmp_path)
 
     assert (resolved, rule) == (sys.executable, "tau interpreter")
 
 
-def test_settings_read_environment_overrides_and_tolerate_junk() -> None:
+def test_settings_read_environment_overrides_and_tolerate_junk(tmp_path: Any) -> None:
     module = _load_extension()
     settings = module.settings_from_env(
         {
@@ -126,13 +130,248 @@ def test_settings_read_environment_overrides_and_tolerate_junk() -> None:
             "TAU_PY_LINE_CHARS": "40",
             "TAU_PY_CELL_TIMEOUT_MS": "250",
             "TAU_PY_ABORT_GRACE_MS": "soon",
-        }
+        },
+        tmp_path,
     )
 
     assert settings.max_output_chars == 1200
     assert settings.line_chars == 40
     assert settings.cell_timeout_ms == 250
     assert settings.abort_grace_ms == module.DEFAULT_ABORT_GRACE_MS
+
+
+# -- project venv --------------------------------------------------------------
+
+
+def _touch(path: Path, text: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _make_venv(root: Path) -> Path:
+    """Create a real venv the tests can execute, using the running interpreter."""
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(root / ".venv")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return root / ".venv"
+
+
+def _home_env(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+
+
+def test_project_venv_is_found_in_an_ancestor(tmp_path: Path) -> None:
+    module = _load_extension()
+    home = tmp_path / "home"
+    project = home / "dev" / "repo"
+    nested = project / "src" / "pkg"
+    nested.mkdir(parents=True)
+    _touch(project / ".git", "gitdir: x\n")
+    _touch(project / ".venv" / "bin" / "python", "#!/bin/sh\n")
+
+    venv_dir, interpreter = module.find_project_venv(nested, {"HOME": str(home), "PATH": "/bin"})
+
+    assert venv_dir == project / ".venv"
+    assert interpreter == project / ".venv" / "bin" / "python"
+
+
+def test_a_home_venv_cannot_hijack_a_project(tmp_path: Path) -> None:
+    """The search stops at the project root, and below `$HOME` when there is none."""
+    module = _load_extension()
+    home = tmp_path / "home"
+    project = home / "dev" / "repo"
+    project.mkdir(parents=True)
+    _touch(home / ".venv" / "bin" / "python", "#!/bin/sh\n")
+
+    assert module.find_project_venv(project, {"HOME": str(home), "PATH": "/bin"}) == (None, None)
+
+
+def test_a_home_venv_counts_when_the_session_runs_in_home(tmp_path: Path) -> None:
+    module = _load_extension()
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    _touch(home / ".venv" / "bin" / "python", "#!/bin/sh\n")
+
+    venv_dir, _interpreter = module.find_project_venv(home, {"HOME": str(home), "PATH": "/bin"})
+
+    assert venv_dir == home / ".venv"
+
+
+def test_a_venv_at_the_git_root_is_in_scope(tmp_path: Path) -> None:
+    module = _load_extension()
+    home = tmp_path / "home"
+    repo = home / "repo"
+    nested = repo / "deep" / "nested"
+    nested.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    _touch(repo / ".venv" / "bin" / "python", "#!/bin/sh\n")
+
+    venv_dir, _interpreter = module.find_project_venv(nested, {"HOME": str(home), "PATH": "/bin"})
+
+    assert venv_dir == repo / ".venv"
+
+
+def test_a_half_created_venv_reports_no_interpreter(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _touch(project / ".venv" / "README", "half-created\n")
+
+    venv_dir, interpreter = module.find_project_venv(project, _home_env(tmp_path))
+
+    assert venv_dir == project / ".venv"
+    assert interpreter is None
+
+
+def test_an_active_venv_wins_over_path(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    python = _make_venv(project) / "bin" / "python"
+
+    interpreter, source, report = module.choose_interpreter(_home_env(tmp_path), project)
+
+    assert interpreter == str(python)
+    assert "project venv" in source
+    assert (report.state, report.venv_dir) == ("active", project / ".venv")
+
+
+def test_a_pin_beats_the_project_venv(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _make_venv(project)
+    env = {**_home_env(tmp_path), "TAU_PYTHON": "/opt/special/bin/python"}
+
+    interpreter, source, report = module.choose_interpreter(env, project)
+
+    assert interpreter == "/opt/special/bin/python"
+    assert source == "TAU_PYTHON pin"
+    assert report.state == "pinned"
+    assert "ignored" in report.note
+
+
+def test_venv_mode_off_ignores_the_venv(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _make_venv(project)
+    env = {**_home_env(tmp_path), "TAU_PY_VENV": "off"}
+
+    interpreter, source, report = module.choose_interpreter(env, project)
+
+    assert report.state == "off"
+    assert source.startswith("PATH") or source == "tau interpreter"
+    assert interpreter != str(project / ".venv" / "bin" / "python")
+
+
+def test_a_missing_venv_in_require_mode_says_uv_will_create_it(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    _interpreter, _source, report = module.choose_interpreter(
+        {**_home_env(tmp_path), "TAU_PY_VENV": "require"}, project
+    )
+
+    assert (report.state, report.venv_dir) == ("missing", None)
+    assert "uv" in report.note
+
+
+def test_a_broken_venv_is_not_silently_replaced(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    _touch(project / ".venv" / "pyvenv.cfg", "broken\n")
+
+    _interpreter, _source, report = module.choose_interpreter(_home_env(tmp_path), project)
+
+    assert report.state == "broken"
+    assert "uv venv" in report.note
+
+
+def test_a_lockfile_goes_through_uv_sync(tmp_path: Path) -> None:
+    module = _load_extension()
+    _touch(tmp_path / "uv.lock", "")
+    _touch(tmp_path / "requirements.txt", "numpy\n")
+
+    assert module.provision_steps(tmp_path / ".venv", tmp_path) == [["uv", "sync"]]
+
+
+def test_requirements_files_are_installed_into_the_venv(tmp_path: Path) -> None:
+    module = _load_extension()
+    _touch(tmp_path / "requirements.txt", "numpy\n")
+
+    steps = module.provision_steps(tmp_path / ".venv", tmp_path)
+
+    assert len(steps) == 1
+    assert steps[0][:4] == ["uv", "pip", "install", "--python"]
+    assert steps[0][-2:] == ["-r", "requirements.txt"]
+
+
+def test_a_pyproject_without_a_lock_still_uses_uv_sync(tmp_path: Path) -> None:
+    module = _load_extension()
+    _touch(tmp_path / "pyproject.toml", "[project]\nname='x'\n")
+
+    assert module.provision_steps(tmp_path / ".venv", tmp_path) == [["uv", "sync"]]
+
+
+def test_no_manifest_means_no_dependency_step(tmp_path: Path) -> None:
+    module = _load_extension()
+
+    assert module.provision_steps(tmp_path / ".venv", tmp_path) == []
+
+
+async def test_uv_provisions_a_working_project_venv(tmp_path: Path) -> None:
+    """The venv uv creates is the one the kernel then resolves to."""
+    module = _load_extension()
+    env = {"HOME": str(tmp_path / "home"), "PATH": os.environ.get("PATH", "")}
+    if module.uv_binary(env) is None:
+        pytest.skip("uv is not installed")
+    project = tmp_path / "proj"
+    _touch(project / "requirements.txt", "")
+
+    report = await module.provision_venv(project, env)
+
+    assert report.ok, report.render()
+    assert report.state == "provisioned"
+    interpreter, _source, resolved = module.choose_interpreter(env, project)
+    assert resolved.state == "active"
+    check = subprocess.run(
+        [interpreter, "-c", "import sys; print(sys.prefix)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr
+    assert Path(check.stdout.strip()).resolve() == (project / ".venv").resolve()
+
+    again = await module.provision_venv(project, env)
+
+    assert (again.ok, again.state) == (True, "reused")
+
+
+def test_provisioning_reports_a_missing_uv(tmp_path: Path) -> None:
+    module = _load_extension()
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    report = module.provision_venv_sync(project, {"PATH": str(tmp_path)})
+
+    assert report.ok is False
+    assert report.state == "uv missing"
+
+
+def test_venv_report_renders_one_status_line() -> None:
+    module = _load_extension()
+
+    assert (
+        module.VenvReport("prefer", "missing", None, None).render()
+        == "missing: none at or above cwd (mode=prefer)"
+    )
+    venv_dir = Path("/repo/.venv")
+    found = module.VenvReport("prefer", "active", venv_dir, venv_dir / "bin" / "python")
+    assert found.render() == "active: /repo/.venv (mode=prefer)"
 
 
 # -- output shape --------------------------------------------------------------
@@ -294,7 +533,7 @@ async def test_cell_source_survives_the_protocol_pipe(tmp_path: Any) -> None:
 
 async def test_closing_the_kernel_stops_the_bridge_process(tmp_path: Any) -> None:
     module = _load_extension()
-    kernel = module.PythonKernel(_settings(module), tmp_path)
+    kernel = module.PythonKernel(_settings(module, tmp_path), tmp_path)
     await kernel.exec_cell("1")
     pid = kernel.pid
     assert pid is not None
@@ -315,6 +554,7 @@ async def test_a_missing_interpreter_is_reported_as_a_tool_error(tmp_path: Any) 
         line_chars=100,
         cell_timeout_ms=0,
         abort_grace_ms=100,
+        venv=module.VenvReport("prefer", "pinned", None, None),
     )
     kernel = module.PythonKernel(settings, tmp_path)
 
