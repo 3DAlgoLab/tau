@@ -189,6 +189,56 @@ async def test_harness_passes_canonical_tools_to_loop() -> None:
     assert provider.calls[0][3] == [tool]
 
 
+@pytest.mark.anyio
+async def test_before_model_request_runs_before_every_provider_call() -> None:
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, JSONValue],
+        signal=None,  # noqa: ANN001
+        on_update=None,  # noqa: ANN001
+    ) -> AgentToolResult:
+        del tool_call_id, arguments, signal, on_update
+        return AgentToolResult(content="ok")
+
+    tool = AgentTool(
+        name="echo",
+        label="Echo",
+        description="Echo text.",
+        parameters={"type": "object"},
+        execute_fn=execute,
+    )
+    call = ToolCall(id="call-1", name="echo", arguments={})
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(),
+                tool_call_end(call),
+                assistant_done(AssistantMessage(content=[call]), "toolUse"),
+            ],
+            [assistant_start(), assistant_done(AssistantMessage(content="Done"))],
+        ]
+    )
+    observed: list[int] = []
+
+    async def before_model_request() -> None:
+        observed.append(len(provider.calls))
+
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            tools=[tool],
+            before_model_request=before_model_request,
+        )
+    )
+
+    _ = [event async for event in harness.prompt("echo")]
+
+    # One call before each request, and never after the provider was reached.
+    assert observed == [0, 1]
+
+
 def test_queue_mutators_return_canonical_snapshots() -> None:
     harness = AgentHarness(
         AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Tau.")

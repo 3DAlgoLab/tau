@@ -46,6 +46,11 @@ class AgentHarnessConfig:
     session_id: str | None = None
     before_tool_call: BeforeToolCall | None = None
     after_tool_call: AfterToolCall | None = None
+    # Awaited immediately before every provider request of a run. The host uses
+    # this boundary for policy that must happen between turns (the coding
+    # session compacts context here so a long run never reaches the provider's
+    # hard limit). Exceptions propagate: a broken hook must not be silent.
+    before_model_request: Callable[[], Awaitable[None]] | None = None
 
 
 class SimpleCancellationToken:
@@ -103,7 +108,12 @@ class AgentHarness:
         self._messages.append(message)
 
     def replace_messages(self, messages: Sequence[AgentMessage]) -> None:
-        self._messages = list(messages)
+        """Replace the transcript contents in place (identity is preserved).
+
+        A running loop holds this list by reference, so rebinding would leave it
+        appending to a stale transcript after compaction rewrites the history.
+        """
+        self._messages[:] = messages
 
     def subscribe(self, listener: EventListener) -> Callable[[], None]:
         self._listeners.append(listener)
@@ -186,6 +196,7 @@ class AgentHarness:
                 get_follow_up_messages=self._drain_follow_up_messages,
                 before_tool_call=self._config.before_tool_call,
                 after_tool_call=self._config.after_tool_call,
+                before_model_request=self._config.before_model_request,
             ):
                 await self._notify(event)
                 yield event

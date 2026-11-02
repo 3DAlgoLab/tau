@@ -176,6 +176,10 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "maximum four words, no quotes, no punctuation-only output."
 )
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
+# How many times one run may compact and continue after a context overflow. A
+# continued run keeps only its recent tail, so a long tool-calling chain can
+# refill the window; recovery repeats instead of ending on a second 400.
+MAX_OVERFLOW_RECOVERIES = 2
 
 
 async def _await_cleanup_completion[CleanupResult](
@@ -780,6 +784,9 @@ class CodingSession:
             image_support=image_support,
             project_trust_resolution=trust_resolution,
         )
+        # Context policy is a coding-session concern; the harness only exposes
+        # the request boundary. See `_compact_context_before_request`.
+        session._harness.config.before_model_request = session._compact_context_before_request
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -3470,50 +3477,77 @@ class CodingSession:
                 await self._extension_runtime.emit_event(compaction_end)
                 yield compaction_end
                 if compacted:
-                    retry_start = AutoRetryStartEvent(
-                        attempt=1,
-                        max_attempts=1,
-                        delay_ms=0,
-                        error_message=overflow_message.error_message or "Context overflow",
-                    )
-                    await self._extension_runtime.emit_event(retry_start)
-                    yield retry_start
-                    events = self._harness.continue_()
-                    self._invalidate_context_usage_cache()
-                    overflow_retry_error: str | None = None
-                    async for retry_event in events:
-                        if isinstance(retry_event, ToolExecutionEndEvent):
-                            self._invalidate_context_usage_cache()
-                        if (
-                            isinstance(retry_event, MessageEndEvent)
-                            and isinstance(retry_event.message, AssistantMessage)
-                            and retry_event.message.stop_reason in {"error", "aborted"}
-                        ):
-                            overflow_retry_error = (
-                                retry_event.message.error_message or "Provider request aborted"
-                            )
-                            if retry_event.message.stop_reason == "error":
-                                self._last_diagnostic_log_path = (
-                                    self._diagnostic_logger.log_assistant_error(
-                                        context=context,
-                                        phase="agent_loop_retry",
-                                        message=retry_event.message,
-                                    )
+                    # An overflow inside a retry used to be terminal: the retry
+                    # stream had no recovery of its own. Keep compacting and
+                    # continuing until the run fits or the bounded budget runs
+                    # out, and report each retry separately.
+                    overflow_error = overflow_message.error_message or "Context overflow"
+                    for attempt in range(1, MAX_OVERFLOW_RECOVERIES + 1):
+                        retry_start = AutoRetryStartEvent(
+                            attempt=attempt,
+                            max_attempts=MAX_OVERFLOW_RECOVERIES,
+                            delay_ms=0,
+                            error_message=overflow_error,
+                        )
+                        await self._extension_runtime.emit_event(retry_start)
+                        yield retry_start
+                        events = self._harness.continue_()
+                        self._invalidate_context_usage_cache()
+                        overflow_retry_error: str | None = None
+                        retry_overflow: AssistantMessage | None = None
+                        async for retry_event in events:
+                            if isinstance(retry_event, ToolExecutionEndEvent):
+                                self._invalidate_context_usage_cache()
+                            if (
+                                isinstance(retry_event, MessageEndEvent)
+                                and isinstance(retry_event.message, AssistantMessage)
+                                and retry_event.message.stop_reason in {"error", "aborted"}
+                            ):
+                                overflow_retry_error = (
+                                    retry_event.message.error_message or "Provider request aborted"
                                 )
-                        if isinstance(retry_event, AgentEndEvent):
-                            yield SessionAgentEndEvent(
-                                messages=retry_event.messages,
-                                will_retry=False,
-                            )
-                        else:
-                            yield retry_event
-                    session_event_4 = AutoRetryEndEvent(
-                        success=overflow_retry_error is None,
-                        attempt=1,
-                        final_error=overflow_retry_error,
-                    )
-                    await self._extension_runtime.emit_event(session_event_4)
-                    yield session_event_4
+                                if retry_event.message.stop_reason == "error":
+                                    self._last_diagnostic_log_path = (
+                                        self._diagnostic_logger.log_assistant_error(
+                                            context=context,
+                                            phase="agent_loop_retry",
+                                            message=retry_event.message,
+                                        )
+                                    )
+                                    if is_context_overflow_error(retry_event.message):
+                                        retry_overflow = retry_event.message
+                            if isinstance(retry_event, AgentEndEvent):
+                                yield SessionAgentEndEvent(
+                                    messages=retry_event.messages,
+                                    will_retry=retry_overflow is not None,
+                                )
+                            else:
+                                yield retry_event
+                        session_event_4 = AutoRetryEndEvent(
+                            success=overflow_retry_error is None,
+                            attempt=attempt,
+                            final_error=overflow_retry_error,
+                        )
+                        await self._extension_runtime.emit_event(session_event_4)
+                        yield session_event_4
+                        if retry_overflow is None or attempt >= MAX_OVERFLOW_RECOVERIES:
+                            break
+                        overflow_error = retry_overflow.error_message or "Context overflow"
+                        recovery_start = CompactionStartEvent(reason="overflow")
+                        await self._extension_runtime.emit_event(recovery_start)
+                        yield recovery_start
+                        recovered = await self._try_overflow_compact(context=context)
+                        recovery_end = CompactionEndEvent(
+                            reason="overflow",
+                            result=None,
+                            aborted=not recovered,
+                            will_retry=recovered,
+                            error_message=None if recovered else "Overflow compaction failed",
+                        )
+                        await self._extension_runtime.emit_event(recovery_end)
+                        yield recovery_end
+                        if not recovered:
+                            break
             elif route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
@@ -3907,6 +3941,19 @@ class CodingSession:
             provider_name=self.provider_name,
             inference_provider=self._inference_provider,
             session_id=self._config.session_id,
+        )
+
+    async def _compact_context_before_request(self) -> None:
+        """Compact between turns instead of waiting for the provider's 400.
+
+        Auto-compaction at prompt boundaries is not enough: one run can chain
+        many tool calls (or extension follow-ups) and never reach a boundary
+        before the window is exhausted. Checking before every provider request
+        keeps the compaction reserve intact mid-run.
+        """
+        await self._try_auto_compact(
+            context=self._diagnostic_context(),
+            phase="auto_compact_before_request",
         )
 
     async def _try_auto_compact(

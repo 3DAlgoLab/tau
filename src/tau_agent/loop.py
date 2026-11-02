@@ -47,6 +47,7 @@ AfterToolCall = Callable[
     [ToolCall, AgentToolResult, bool],
     Awaitable[tuple[AgentToolResult, bool]],
 ]
+BeforeModelRequest = Callable[[], Awaitable[None]]
 
 
 async def run_agent_loop(
@@ -65,6 +66,7 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
+    before_model_request: BeforeModelRequest | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop and emit Pi-compatible agent events."""
     new_messages = list(prompts)
@@ -131,6 +133,12 @@ async def run_agent_loop(
                 yield TurnEndEvent(message=aborted)
                 yield AgentEndEvent(messages=new_messages)
                 return
+
+            # Host policy that must run between turns (context compaction) gets
+            # a boundary here: the transcript is final for this request, but no
+            # provider call has been made yet.
+            if before_model_request is not None:
+                await before_model_request()
 
             # Python async generators cannot pass a yielding callback through a
             # normal await cleanly, so consume the assistant sub-generator and

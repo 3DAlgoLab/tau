@@ -45,12 +45,15 @@ not expected to match.
 ## Automatic compaction
 
 By default, Tau compacts automatically when the estimate gets close to the
-model's context window. It checks three moments:
+model's context window. It checks these moments:
 
+- before every provider request, so a single long run that chains tool calls
+  cannot reach the hard limit between prompt boundaries,
 - before a new prompt (to catch context added out-of-band),
 - after a successful turn (to compact before your next turn), and
-- after a context-overflow error (force compaction regardless of the local estimate,
-  then retry once).
+- after a context-overflow error (force compaction regardless of the local
+  estimate, then retry). If the continued run overflows again, Tau compacts and
+  retries again, up to a bounded number of recoveries per run.
 
 When it compacts, Tau asks the model to summarize older messages, keeps a recent
 suffix of the conversation, and continues. The original session file is never

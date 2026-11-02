@@ -71,7 +71,13 @@ from tau_coding import (
 )
 from tau_coding import session as coding_session_module
 from tau_coding.codex_model_store import cached_codex_model_catalog, save_codex_model_catalog
-from tau_coding.events import AgentSettledEvent, QueueUpdateEvent, SessionAgentEndEvent
+from tau_coding.events import (
+    AgentSettledEvent,
+    AutoRetryEndEvent,
+    AutoRetryStartEvent,
+    QueueUpdateEvent,
+    SessionAgentEndEvent,
+)
 from tau_coding.extensions import (
     DynamicProvider,
     OpenAICompatibleTransport,
@@ -762,6 +768,25 @@ async def test_reconcile_persistence_failure_is_logged(tmp_path: Path) -> None:
     ]
     assert diagnostics[-1]["phase"] == "session_persistence_reconcile"
     assert diagnostics[-1]["exception"]["message"] == "simulated message_always failure"
+
+
+def _echo_tool() -> AgentTool:
+    async def echo(
+        tool_call_id: object,
+        arguments: object,
+        signal: object = None,
+        on_update: object = None,
+    ) -> AgentToolResult:
+        del tool_call_id, arguments, signal, on_update
+        return AgentToolResult(content=[TextContent(text="ok")])
+
+    return AgentTool(
+        name="echo",
+        label="Echo",
+        description="Return ok.",
+        parameters={"type": "object"},
+        execute_fn=echo,
+    )
 
 
 def _hang_tool(tool_started: asyncio.Event, release: asyncio.Event) -> AgentTool:
@@ -4041,13 +4066,15 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="First answer")),
             ],
-            [
-                assistant_start(model="fake"),
-                assistant_done(message=AssistantMessage(content="Second answer")),
-            ],
+            # The request-boundary hook compacts before the second prompt's
+            # first request, so the summary response comes before the answer.
             [
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="Generated automatic summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
             ],
             [
                 assistant_start(model="fake"),
@@ -4079,7 +4106,7 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
     assert compactions[0].first_kept_entry_id in session.state.context_entry_ids
     assert compactions[0].tokens_before is not None
     assert compactions[0].tokens_before > 0
-    assert "Explain sessions." in provider.calls[2][2][0].content
+    assert "Explain sessions." in provider.calls[1][2][0].content
     _assert_messages(
         provider.calls[3][2],
         [
@@ -4159,13 +4186,15 @@ async def test_session_auto_compacts_with_pi_style_default_threshold(
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="First answer")),
             ],
-            [
-                assistant_start(model="fake"),
-                assistant_done(message=AssistantMessage(content="Second answer")),
-            ],
+            # The request-boundary hook compacts before the second prompt's
+            # first request, so the summary response comes before the answer.
             [
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="Default threshold summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
             ],
         ]
     )
@@ -4202,6 +4231,143 @@ async def test_session_auto_compacts_with_pi_style_default_threshold(
 
     assert len(compactions) == 1
     assert compactions[0].summary == "Default threshold summary"
+
+
+@pytest.mark.anyio
+async def test_session_compacts_between_requests_of_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A tiny keep-recent window makes a mid-run cut point reachable in a small
+    # transcript; production keeps the 20k-token default.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    tool_call = ToolCall(id="call-1", name="echo", arguments={})
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=assistant_content("Working.", [tool_call]),
+                        stop_reason="toolUse",
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Mid-run summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Finished.")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=30_000,
+        )
+    )
+
+    _events = await _collect_session_events(
+        session.prompt("First prompt.\n" + ("old context " * 12_000))
+    )
+
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert len(compactions) == 1
+    assert compactions[0].summary == "Mid-run summary"
+    # The summarizer runs between the two assistant requests, and the second
+    # request already carries the compacted prefix.
+    assert provider.calls[1][1].startswith("You are a context summarization assistant.")
+    assert provider.calls[2][2][0].content.startswith(
+        "Previous conversation summary:\nMid-run summary"
+    )
+
+
+@pytest.mark.anyio
+async def test_session_recovers_when_the_overflow_retry_also_overflows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Regression: a second overflow used to land in the retry stream, which had
+    # no recovery of its own, so the run ended on a provider 400 even though one
+    # more compaction would have fit.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    parent_id: str | None = None
+    for message in (
+        UserMessage(content="Start.\n" + ("old context " * 12_000)),
+        AssistantMessage(content="First answer"),
+        UserMessage(content="Second."),
+        AssistantMessage(content="Second answer"),
+    ):
+        entry = MessageEntry(parent_id=parent_id, message=message)
+        await storage.append(entry)
+        parent_id = entry.id
+    assert parent_id is not None
+    await storage.append(LeafEntry(parent_id=parent_id, entry_id=parent_id))
+
+    overflow = (
+        "dpi1 request failed with status 400 for model coder1: request exceeds the "
+        "context window: prompt (131064 tokens) leaves no room to answer in the "
+        "context (131072); requests are never truncated"
+    )
+    provider = FakeProvider(
+        [
+            [assistant_start(model="fake"), assistant_error(overflow)],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First recovery summary")),
+            ],
+            [assistant_start(model="fake"), assistant_error(overflow)],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second recovery summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Recovered.")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=100_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Third."))
+
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert [entry.summary for entry in compactions] == [
+        "First recovery summary",
+        "Second recovery summary",
+    ]
+    assert [event.attempt for event in events if isinstance(event, AutoRetryStartEvent)] == [1, 2]
+    assert [event.success for event in events if isinstance(event, AutoRetryEndEvent)] == [
+        False,
+        True,
+    ]
+    assert len(provider.calls) == 5
+    assert any(
+        isinstance(event, MessageEndEvent)
+        and isinstance(event.message, AssistantMessage)
+        and event.message.text == "Recovered."
+        for event in events
+    )
 
 
 @pytest.mark.anyio
