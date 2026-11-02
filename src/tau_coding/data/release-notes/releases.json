@@ -1,5 +1,25 @@
 [
   {
+    "version": "0.4.9b2",
+    "date": "2026-11-02",
+    "sections": {
+      "New": [
+        "Copy the last assistant response to the clipboard with `/copy`.",
+        "Start a fresh launch and `/new` on the model already in use instead of a provider's configured default; `-m <model>` and `--provider <name>` still decide.",
+        "Add example extensions for a session-persistent Python kernel (`python_kernel`) and for rescuing turns that emit no tool call (`stall_guard`)."
+      ],
+      "Changed": [
+        "When no provider is requested, Tau prefers past choices over provider order: the remembered pair, then saved scoped models, then provider defaults. `--print`, `--mode`, and RPC mode resolve the same way instead of failing on a default provider that has no credential in the environment.",
+        "Show `read` and `edit` paths relative to the working directory in the transcript.",
+        "Replace the prompt activity indicator with a braille spinner and compact the prompt and session-info footer.",
+        "Reduce text input latency, prompt echo, and CPU usage in the TUI."
+      ],
+      "Fixed": [
+        "Improve tool call and session cancellation reliability."
+      ]
+    }
+  },
+  {
     "version": "0.4.8",
     "date": "2026-10-14",
     "sections": {
