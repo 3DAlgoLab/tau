@@ -50,7 +50,9 @@ model's context window. It checks these moments:
 - before every provider request, so a single long run that chains tool calls
   cannot reach the hard limit between prompt boundaries,
 - before a new prompt (to catch context added out-of-band),
-- after a successful turn (to compact before your next turn), and
+- after a successful turn (to compact before your next turn),
+- after a response the provider truncated at its limit without producing anything you
+  could read (compaction makes the room, then Tau resumes the work once), and
 - after a context-overflow error (force compaction regardless of the local
   estimate, then retry). If the continued run overflows again, Tau compacts and
   retries again, up to a bounded number of recoveries per run.
@@ -73,6 +75,9 @@ Automatic compaction is best-effort: if summarization fails, Tau logs it and kee
 the original context. During successful overflow recovery, the TUI shows compaction
 and retry progress instead of presenting the intermediate provider rejection as a
 terminal error. The error becomes visible only if recovery cannot complete.
+
+A truncated answer you can already read is left as it is. Tau does not spend a request
+resuming an answer that reached you, since continuing it is your call.
 
 ## Manual compaction
 

@@ -1,7 +1,7 @@
 import asyncio
 import json
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from io import BytesIO
 from pathlib import Path
 
@@ -26,7 +26,7 @@ from tau_agent import (
     UserMessage,
 )
 from tau_agent.messages import AssistantMessageDiagnostic, assistant_content
-from tau_agent.provider_events import AssistantErrorEvent
+from tau_agent.provider_events import AssistantDoneEvent, AssistantErrorEvent
 from tau_agent.session import (
     CompactionEntry,
     CustomEntry,
@@ -50,6 +50,7 @@ from tau_ai import (
 )
 from tau_ai.events import AssistantMessageEvent
 from tau_coding import (
+    SUMMARIZATION_SYSTEM_PROMPT,
     CodingSession,
     CodingSessionConfig,
     FileCredentialStore,
@@ -4410,6 +4411,349 @@ async def test_session_uses_live_provider_limits_for_compaction_threshold(
     assert session.auto_compact_token_threshold == 334_800
     assert session.context_window_source == "provider live catalog"
     assert session.model_limits_discovery_error is None
+
+
+class ScriptedTurnProvider:
+    """A provider whose scripted turns are immune to compaction's extra requests.
+
+    Two properties keep these fixtures about behavior rather than request order:
+
+    * Scripted turns are consumed only by conversational requests. Automatic
+      compaction can fire from a request boundary, the truncation recovery path, or
+      the end of a run, and a turn pinned to each position would make the fixture
+      assert on the count of requests instead of on what the run did.
+    * Each assistant message is built when its turn streams. Provider usage only
+      anchors the context estimate when the response postdates every earlier
+      message, so a message built before the run would predate the run's own user
+      message and tool results, and the estimate would silently fall back to
+      characters - which is precisely the blind spot these tests are about.
+    """
+
+    def __init__(self, turns: Sequence[Callable[[], AssistantMessage]]) -> None:
+        self._turns = list(turns)
+        self.calls: list[tuple[str, str, list[AgentMessage], list[AgentTool]]] = []
+        self.summary_calls = 0
+
+    @property
+    def conversational_calls(self) -> list[tuple[str, str, list[AgentMessage], list[AgentTool]]]:
+        return [call for call in self.calls if call[1] == "You are Tau."]
+
+    def stream_response(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[AgentMessage],
+        tools: list[AgentTool],
+        signal: object | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[object]:
+        del signal, session_id
+        self.calls.append((model, system, list(messages), list(tools)))
+        if system.startswith(SUMMARIZATION_SYSTEM_PROMPT[:24]):
+            self.summary_calls += 1
+            number = self.summary_calls
+
+            def scripted_summary() -> AssistantMessage:
+                return AssistantMessage(content=f"Compacted summary {number}")
+
+            turn: Callable[[], AssistantMessage] = scripted_summary
+        elif self._turns:
+            turn = self._turns.pop(0)
+        else:
+            raise AssertionError("ScriptedTurnProvider ran out of scripted turns")
+
+        async def events() -> AsyncIterator[object]:
+            message = turn()
+            yield assistant_start(model=model)
+            reason = message.stop_reason or "stop"
+            yield AssistantDoneEvent(reason=reason, message=message)
+
+        return events()
+
+
+def _truncated_thinking_turn(*, usage_total: int) -> AssistantMessage:
+    """One turn cut off by the output limit while still thinking: no text, no tool."""
+    return AssistantMessage(
+        content=[ThinkingContent(thinking="Planning the next edit")],
+        usage=Usage(total_tokens=usage_total),
+        stop_reason="length",
+    )
+
+
+def _answering_turn(
+    *, text: str, usage_total: int, tool: ToolCall | None = None
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=assistant_content(text, [tool] if tool else []),
+        usage=Usage(total_tokens=usage_total),
+        stop_reason="toolUse" if tool else "stop",
+    )
+
+
+@pytest.mark.anyio
+async def test_session_compacts_mid_run_on_provider_reported_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A transcript the character estimate calls tiny can still sit near the context
+    # limit, which only the provider's own usage number reveals. This is the live
+    # shape that let a run climb into the roof between tool calls.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first_call = ToolCall(id="call-1", name="echo", arguments={})
+    second_call = ToolCall(id="call-2", name="echo", arguments={})
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _answering_turn(text="First.", usage_total=40_000, tool=first_call),
+            lambda: _answering_turn(text="Second.", usage_total=60_000, tool=second_call),
+            lambda: _answering_turn(text="Done.", usage_total=70_000),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Work through the task."))
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    # Every request boundary of one run, not just the run's start and end, and each
+    # boundary measured the provider's number rather than the character count.
+    assert provider.summary_calls == 3
+    assert [entry.summary for entry in compactions] == [
+        "Compacted summary 1",
+        "Compacted summary 2",
+        "Compacted summary 3",
+    ]
+    # Each boundary measured the provider's reported context, not a character count
+    # of this short transcript (which would be a few dozen tokens).
+    measured = [entry.tokens_before or 0 for entry in compactions]
+    assert [round(value, -3) for value in measured] == [40_000, 60_000, 70_000]
+    assert len(provider.conversational_calls) == 3
+    assert provider.conversational_calls[1][2][0].content.startswith(
+        "Previous conversation summary:\nCompacted summary 1"
+    )
+    # One run, so the UI shows a single settle rather than a fake turn boundary.
+    assert sum(isinstance(event, SessionAgentEndEvent) for event in events) == 1
+    assert sum(isinstance(event, AgentSettledEvent) for event in events) == 1
+
+
+@pytest.mark.anyio
+async def test_session_compacts_and_continues_after_an_empty_truncated_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The live failure: the window was full, so the provider stopped the response
+    # mid-thinking. The turn produced no text and no tool call, the run settled with
+    # nothing visible, and nothing resumed it - compaction then ran after the fact
+    # while the session sat idle until the user typed "continue".
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=40_000),
+            lambda: _answering_turn(text="Resuming the work.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+    extension_events = _record_extension_events(session, monkeypatch)
+
+    events = await _collect_session_events(session.prompt("Do the thing."))
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    # Room was the constraint, so the repair is room first: compact, then continue.
+    assert [entry.summary for entry in compactions] == ["Compacted summary 1"]
+    assert provider.summary_calls == 1
+    assert len(provider.conversational_calls) == 2
+    assert provider.conversational_calls[1][2][0].content.startswith(
+        "Previous conversation summary:\nCompacted summary 1"
+    )
+    assert [
+        (event.attempt, event.success) for event in events if isinstance(event, AutoRetryEndEvent)
+    ] == [(1, True)]
+    lifecycle_events = [
+        event.type
+        for event in extension_events
+        if event.type
+        in {
+            "compaction_start",
+            "compaction_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "agent_settled",
+        }
+    ]
+    assert lifecycle_events == [
+        "compaction_start",
+        "compaction_end",
+        "auto_retry_start",
+        "auto_retry_end",
+        "agent_settled",
+    ]
+    assert "Resuming the work." in [message.text for message in session.messages]
+    # The recovery belongs to the same run: the UI settles once, not twice.
+    assert sum(isinstance(event, AgentSettledEvent) for event in events) == 1
+
+
+@pytest.mark.anyio
+async def test_session_continues_an_empty_truncated_turn_without_compacting(
+    tmp_path: Path,
+) -> None:
+    # With room to spare the truncation came from the model's own output cap, so a
+    # continue is the whole repair and a summary would only cost an expensive call.
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=9_000),
+            lambda: _answering_turn(text="Resuming the work.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    _events = await _collect_session_events(session.prompt("Do the thing."))
+
+    assert provider.summary_calls == 0
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert len(provider.conversational_calls) == 2
+    assert "Resuming the work." in [message.text for message in session.messages]
+
+
+@pytest.mark.anyio
+async def test_session_does_not_recover_a_truncated_turn_that_produced_text(
+    tmp_path: Path,
+) -> None:
+    # A cut-off answer the user can already read is theirs to continue; resuming it
+    # silently would double the request cost of every verbose reply.
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: AssistantMessage(
+                content="A long answer that ran out of room",
+                usage=Usage(total_tokens=40_000),
+                stop_reason="length",
+            ),
+            lambda: _answering_turn(text="Should not run.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Explain it."))
+
+    assert len(provider.conversational_calls) == 1
+    assert not any(isinstance(event, AutoRetryStartEvent) for event in events)
+    assert all(message.text != "Should not run." for message in session.messages)
+
+
+@pytest.mark.anyio
+async def test_truncation_recovery_stops_after_one_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A second truncation means the model keeps running out of output room, so the
+    # run reports a failure the user can act on instead of looping on expensive calls.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=40_000),
+            lambda: _truncated_thinking_turn(usage_total=8_000),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Do the thing."))
+    retry_ends = [event for event in events if isinstance(event, AutoRetryEndEvent)]
+
+    assert len(provider.conversational_calls) == 2
+    assert provider.summary_calls == 1
+    assert [(event.attempt, event.success) for event in retry_ends] == [(1, False)]
+    assert retry_ends[0].final_error is not None
+    assert "truncated" in retry_ends[0].final_error
+    assert sum(isinstance(event, AgentSettledEvent) for event in events) == 1
+
+
+@pytest.mark.anyio
+async def test_truncation_recovery_stands_down_when_compaction_cannot_help(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Over the threshold with no summarizable prefix - most tokens sit in the tail
+    # that has to stay - a continue would just walk into the context limit again.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10_000_000)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=40_000),
+            lambda: _answering_turn(text="Should not run.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Do the thing."))
+
+    assert provider.summary_calls == 0
+    assert len(provider.conversational_calls) == 1
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert not any(isinstance(event, AutoRetryEndEvent) for event in events)
+    assert all(message.text != "Should not run." for message in session.messages)
 
 
 @pytest.mark.anyio

@@ -180,6 +180,25 @@ TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before u
 # continued run keeps only its recent tail, so a long tool-calling chain can
 # refill the window; recovery repeats instead of ending on a second 400.
 MAX_OVERFLOW_RECOVERIES = 2
+# How many times one run may compact and continue after the provider truncates a
+# response at the limit (`stop_reason == "length"`). One attempt is deliberate: a
+# second truncation means the model keeps producing more than the window can
+# hold, which is a decision for the user, not something to keep paying for.
+MAX_TRUNCATION_RECOVERIES = 1
+
+
+def _run_ended_on_empty_truncation(message: AssistantMessage | None) -> bool:
+    """Return whether a settled run ended on a truncated turn with no output.
+
+    A `length` stop is the provider saying it ran out of room mid-response. When
+    the turn still carried text or a tool call, the user can read the partial
+    answer and decide what to do. When it carried only thinking, the run settled
+    with nothing visible at all, which is indistinguishable from the agent going
+    silent, and nothing else in the session resumes it.
+    """
+    if message is None or message.stop_reason != "length" or message.tool_calls:
+        return False
+    return not message_text(message).strip()
 
 
 async def _await_cleanup_completion[CleanupResult](
@@ -3404,6 +3423,7 @@ class CodingSession:
         auto_name_task: asyncio.Task[None] | None = None
         overflow_message: AssistantMessage | None = None
         route_failure_message: AssistantMessage | None = None
+        last_assistant: AssistantMessage | None = None
         try:
             prompt_message: AgentMessage
             if custom_type is not None:
@@ -3442,6 +3462,12 @@ class CodingSession:
                         overflow_message = event.message
                     elif self._should_auto_failover_huggingface_route(event.message):
                         route_failure_message = event.message
+                if isinstance(event, MessageEndEvent) and isinstance(
+                    event.message, AssistantMessage
+                ):
+                    last_assistant = (
+                        event.message if event.message.stop_reason == "length" else None
+                    )
                 if isinstance(event, AgentEndEvent):
                     yield SessionAgentEndEvent(
                         messages=event.messages,
@@ -3552,6 +3578,9 @@ class CodingSession:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
             else:
+                if _run_ended_on_empty_truncation(last_assistant):
+                    async for recovery_event in self._recover_from_truncated_turn(context=context):
+                        yield recovery_event
                 await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
             if auto_name_task is not None:
                 await auto_name_task
@@ -3584,6 +3613,7 @@ class CodingSession:
         events: AsyncIterator[AgentEvent] | None = None
         settled_event: AgentSettledEvent | None = None
         route_failure_message: AssistantMessage | None = None
+        last_assistant: AssistantMessage | None = None
         try:
             events = self._harness.continue_()
             self._invalidate_context_usage_cache()
@@ -3602,6 +3632,12 @@ class CodingSession:
                     )
                     if self._should_auto_failover_huggingface_route(event.message):
                         route_failure_message = event.message
+                if isinstance(event, MessageEndEvent) and isinstance(
+                    event.message, AssistantMessage
+                ):
+                    last_assistant = (
+                        event.message if event.message.stop_reason == "length" else None
+                    )
                 if isinstance(event, AgentEndEvent):
                     yield SessionAgentEndEvent(
                         messages=event.messages,
@@ -3612,6 +3648,9 @@ class CodingSession:
             if route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
+            elif _run_ended_on_empty_truncation(last_assistant):
+                async for recovery_event in self._recover_from_truncated_turn(context=context):
+                    yield recovery_event
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
@@ -4000,6 +4039,78 @@ class CodingSession:
                 exc=exc,
             )
             return False
+
+    async def _recover_from_truncated_turn(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Compact and continue once when a run settles on a truncated turn.
+
+        A `length` stop at a full window is not a retryable request: the same
+        prompt gets truncated again, or rejected outright. Compaction is the only
+        thing that creates room, and nothing outside this method resumes a run
+        that has already settled, so both halves belong here. When the window is
+        not the constraint the truncation came from the model's own output cap, so
+        continuing alone is the whole repair and compaction would only cost a
+        request.
+        """
+        threshold = self.auto_compact_token_threshold
+        if threshold is not None and self.context_token_estimate > threshold:
+            start = CompactionStartEvent(reason="threshold")
+            await self._extension_runtime.emit_event(start)
+            yield start
+            # Plan-based, threshold-agnostic: it makes room with the recent tail
+            # whether the trigger was a rejected request or a truncated one.
+            compacted = await self._try_overflow_compact(context=context)
+            end = CompactionEndEvent(
+                reason="threshold",
+                result=None,
+                aborted=not compacted,
+                will_retry=compacted,
+                error_message=None if compacted else "Truncation recovery compaction failed",
+            )
+            await self._extension_runtime.emit_event(end)
+            yield end
+            if not compacted:
+                return
+        # One continue, reported through the same retry events the overflow recovery
+        # uses so the TUI and extensions see a recovery they can render.
+        retry_start = AutoRetryStartEvent(
+            attempt=1,
+            max_attempts=MAX_TRUNCATION_RECOVERIES,
+            delay_ms=0,
+            error_message="Response truncated at the model output limit",
+        )
+        await self._extension_runtime.emit_event(retry_start)
+        yield retry_start
+        failure: str | None = None
+        events = self._harness.continue_()
+        self._invalidate_context_usage_cache()
+        async for event in events:
+            if isinstance(event, ToolExecutionEndEvent):
+                self._invalidate_context_usage_cache()
+            if isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+                if event.message.stop_reason == "length":
+                    failure = "Response truncated at the model output limit again"
+                elif event.message.stop_reason in {"error", "aborted"}:
+                    failure = event.message.error_message or "Provider request aborted"
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_assistant_error(
+                        context=context,
+                        phase="truncation_recovery",
+                        message=event.message,
+                    )
+            if isinstance(event, AgentEndEvent):
+                yield SessionAgentEndEvent(messages=event.messages, will_retry=False)
+            else:
+                yield event
+        retry_end = AutoRetryEndEvent(
+            success=failure is None,
+            attempt=1,
+            final_error=failure,
+        )
+        await self._extension_runtime.emit_event(retry_end)
+        yield retry_end
 
     async def _try_auto_name_session(
         self,
