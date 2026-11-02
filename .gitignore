@@ -28,3 +28,4 @@ website/.astro/
 # Local scratch tooling
 scripts/analyze_session.py
 .vscode/
+.tau/
