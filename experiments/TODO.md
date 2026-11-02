@@ -135,7 +135,7 @@ cosmetic.
   `~/.tau/tests/test_python_kernel_venv.py` (standalone `unittest`, hardcoded path) is
   now redundant and can be dropped.
 - Commit boundary: `abdd490` (stall guard), `a6dc016` (python kernel) and `81ff167` (the venv rung:
-  extension + tests + docs, one commit) are all on local `main`, none pushed. The earlier "not
+  extension + tests + docs, one commit) are on `main`, pushed to `origin`. The earlier "not
   committed yet" and "blocked on the test port" notes are stale.
 
 ### Deliberate deviations from pi-pytool
@@ -191,37 +191,57 @@ cosmetic.
   the same `export_requested`-style split. Textual owns OSC 52 in the TUI; the core helper only
   shells to `wl-copy`/`pbcopy`/`xclip`/`xsel`/`clip` with a fixed argv and stdin, never a shell.
 
-## Web search (live, untracked)
+## Web search (landed as an example extension)
 
-**Status: works in this install, absent from the repository.** `~/.tau/extensions/web_search.py`
-(1,448 lines) is the only source; `examples/extensions/` has no such file, `dev-notes/` has no
-journal, `website/content/` never mentions it, and `uv run pytest` cannot see it. A fresh clone loses
-it entirely.
+**Status: landed.** `examples/extensions/web_search.py` (1,606 lines) is the source of
+truth, and `uv run pytest` guards it. The same file is installed live at
+`~/.tau/extensions/web_search.py` for this machine; the two differ by exactly one
+docstring usage line. Journal:
+[`dev-notes/web-search-extension.md`](../dev-notes/web-search-extension.md).
 
 - Registered: tools `web_search` (ranked results, optional synthesized answer) and `web_fetch`
   (readable page text, paged by `offset`), command `/websearch`, a `render_call` for each, and prompt
   guidance telling the model when to reach for them.
-- Backend ladder, first one that returns results: `serper`, `exa`, `perplexity`, `firecrawl`,
-  `duckduckgo` (`PROVIDERS`, line 77). Keys via `SERPER_API_KEY`/`SERPER_DEV_API_KEY`, `EXA_API_KEY`,
-  `PERPLEXITY_API_KEY`/`PPLX_API_KEY`; `duckduckgo` is keyless and gated by
-  `TAU_WEB_SEARCH_ALLOW_KEYLESS`; `TAU_WEB_SEARCH_PROVIDER` pins one backend.
+- Backend ladder, first one that returns a usable answer: `serper`, `exa`, `perplexity`, `firecrawl`,
+  `duckduckgo` (`PROVIDERS`). Keys via `SERPER_API_KEY`/`SERPER_DEV_API_KEY`, `EXA_API_KEY`,
+  `PERPLEXITY_API_KEY`/`PPLX_API_KEY`, `FIRECRAWL_API_KEY`; `duckduckgo` is keyless and gated by
+  `TAU_WEB_SEARCH_ALLOW_KEYLESS`; `TAU_WEB_SEARCH_PROVIDER` pins one backend, aliases included
+  (`ddgs`/`pplx`/`fc`/`google`/`any`).
+- Rules beyond the ladder: a `401`/`403` quarantines a backend for
+  `TAU_WEB_SEARCH_DEAD_TTL_SECONDS`; a titles-only result set steps aside for a backend that returns
+  snippets (`TAU_WEB_SEARCH_SNIPPET_FLOOR`); `web_fetch` escalates to Firecrawl `/v2/scrape` for
+  `format: "markdown"`, a `4xx` origin, or a page with too little static text.
 - Knobs: `TAU_WEB_SEARCH_MAX_RESULTS`, `TAU_WEB_SEARCH_SNIPPET_CHARS`, `TAU_WEB_FETCH_MAX_CHARS`,
   `TAU_WEB_SEARCH_TIMEOUT_SECONDS`, `TAU_WEB_SEARCH_PERPLEXITY_MODEL`, `TAU_WEB_SEARCH_CACHE_SECONDS`,
   `TAU_WEB_SEARCH_DEAD_TTL_SECONDS`.
 - No new wheels: it rides on the `httpx[socks]` dependency `tau_ai` already ships and parses payloads
   with the standard library — same rule the python-kernel port holds.
 
-### What is missing before it counts as landed
+### What landed
 
-1. Move the source to `examples/extensions/web_search.py` (single file, like `python_kernel.py`).
-2. Port `~/.tau/tests/test_web_search.py` to `tests/test_web_search_extension.py` and add the
-   `tests/test_example_extensions.py` discovery case, so `uv run pytest` guards it. Keep
-   `live_web_search.py` as a manual probe, not a test.
-3. Docs: `dev-notes/web-search-extension.md`, the `website/content/guides/extensions.md` example list,
-   and the `dev-notes/README.md` index line.
-4. Decide the shipping posture: it adds two tools to **every** session, as `python_kernel.py` does.
-5. Reconcile with Tau's own stance on fetching: state in the dev-note why an extension rather than a
-   built-in tool, so the roadmap issue does not have to be re-litigated.
+1. Single-file source at `examples/extensions/web_search.py`, beside `python_kernel.py`.
+2. `tests/test_web_search_extension.py` (46 tests, no network and no keys) plus the
+   `tests/test_example_extensions.py` discovery case, so `uv run pytest` guards discovery,
+   import, and registration. The live check moved out of the suite to
+   `scripts/live_web_search.py`: it spends real quota and fails when a key rotates.
+3. Docs: `dev-notes/web-search-extension.md`, the `dev-notes/README.md` index line, and the
+   `website/content/guides/extensions.md` example list.
+4. Posture decided: **repo-only example** — not in `src/tau_coding/data/examples/` (still four files
+   per `tests/test_package_metadata.py`) and not in `BUILT_IN_EXTENSIONS` (still only `llama.cpp`).
+   Adopting it is one copy into `~/.tau/extensions/` or one `-e` flag.
+5. Built-in-vs-extension rationale written down in the dev-note's "Shipping posture" section, so the
+   roadmap question does not have to be re-litigated: a built-in loads for every session including
+   `--no-extensions` and is trusted code, while this capability depends on keys the user supplies and
+   returns untrusted remote text.
+
+### Still open
+
+- DuckDuckGo now answers a busy address with an "anomaly" challenge page; the note says the address
+  is rate-limited. A second keyless engine (or `lite.duckduckgo.com`) is the follow-up.
+- Reader mode has no JavaScript path, so SPAs need Firecrawl configured.
+- No per-host fetch policy, no size cap before decode, and no proxy configuration seam.
+- The ladder order is fixed. If installs diverge in which keys they carry, the order (or a per-
+  session preference) should become a setting.
 
 ## Heartbeat / `schedule_prompt` (unofficial, out-of-tree)
 
@@ -343,9 +363,9 @@ What the suite does **not** catch (its fixtures fake `ExtensionContext`):
   Tau but a `model=` job raises `AttributeError` below 0.4.8.
 - `pyproject.toml` declares `tau-ai>=0.4.0`; the honest floor is **0.4.8** for background jobs.
 - Strict mypy is version-sensitive: 2 errors against released 0.4.8 (`Argument 2 to "on" of
-  "ExtensionAPI" …`) and 7 against 0.4.0. It is clean only against this checkout, because of the
-  unpushed `9d57ba7` ("Type the `tau.on` decorator form …"). Nothing at *runtime* needs the unpushed
-  commits.
+  "ExtensionAPI" …`) and 7 against 0.4.0. It is clean only against `9d57ba7` ("Type the `tau.on`
+  decorator form …") in this checkout, which no published wheel carries yet — PyPI stops at 0.4.8.
+  Nothing at *runtime* needs it.
 - The job store is **not** Pi-compatible: `.tau/` vs `.pi/`, and camelCase vs snake_case (`intervalMs`,
   `createdAt`, `lastRun`, `lastStatus`, `nextRun`, `runCount` → `interval_ms`, `created_at`,
   `last_run`, `last_status`, `next_run`, `run_count`), plus an extra
@@ -383,12 +403,15 @@ Extension install notes
 - `tau install <path>` copies into `~/.tau/extensions/`; editing `examples/extensions/stall_guard.py`
   does **not** update the installed copy — re-run `tau install` (or `ln -sf`) after each edit.
 - Extension identity is the module stem and collisions are first-loaded-wins; built-ins load before  user extensions, so a user extension sharing a built-in's stem is silently skipped  (`tau doctor` reports it as a duplicate extension). Keep the stem unique.
-- Nothing is committed for the venv follow-up any more: `81ff167` landed it. `abdd490` (stall guard),
-  `a6dc016`/`81ff167` (python kernel) are all local, unpushed commits.
+- The venv follow-up is committed: `81ff167` landed it, alongside `abdd490` (stall guard) and
+  `a6dc016` (python kernel).
 
-Publishing state (verified 2026-11-03)
-- `origin` is `github.com/3DAlgoLab/tau`, a fork of `huggingface/tau`. `main` is **10 commits ahead,
-  nothing pushed** (`9d57ba7` … `666257c`), plus 7 uncommitted files (`+338/−52`).
+Publishing state (verified 2026-11-03, after `be12417`)
+- `origin` is `github.com/3DAlgoLab/tau`, a fork of `huggingface/tau`. `main` is **level with
+  `origin/main`**; the only uncommitted work is the compaction change (`+338/−52`, 7 files).
+- `publish.yml` triggers only on `release: published`, so pushing `main` cannot publish `0.4.9b2`;
+  `docs.yml` does run on push to `main`. `gh api …/actions/runs` returns `total_count: 0`, so no CI
+  run registered for these pushes — local checks under `TZ=UTC` are the only gate in practice.
 - Guideline audit against `CONTRIBUTING.md`: every local commit carries tests + a `dev-notes/` note +
   a `website/content/` update, `tau_agent` gained no CLI/TUI/path imports, and
   `ruff check` / `ruff format --check` / `mypy` are clean. Roadmap alignment is unverifiable while the
