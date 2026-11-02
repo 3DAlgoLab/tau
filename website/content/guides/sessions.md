@@ -49,7 +49,10 @@ Archiving never deletes session files or project directories.
 The search field filters session names and models within the selected project.
 
 To deliberately start fresh instead of resuming, use `tau --new-session` (or
-`/new` in the TUI).
+`/new` in the TUI). Starting fresh clears the conversation, not the model: the new
+session begins on the model you were using. See
+[Choosing and switching models](/guides/providers-and-models/) for how Tau
+remembers that choice.
 
 When you quit the TUI and the session was persisted, Tau prints a reminder of
 the exact command to resume it:
