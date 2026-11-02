@@ -134,6 +134,12 @@ def _stalled_message() -> AssistantMessage:
     return AssistantMessage(model="fake", content=LEAKED_REPLY)
 
 
+TRUNCATION_WARNING = (
+    "stall-guard: response truncated at the token limit; "
+    "not retrying (Tau will compact context instead)"
+)
+
+
 def _answer(text: str) -> AssistantMessage:
     return AssistantMessage(model="fake", content=text)
 
@@ -296,6 +302,33 @@ async def test_thinking_only_turn_forces_one_retry(tmp_path: Path) -> None:
     corrections = _corrections(session.messages)
     assert len(corrections) == 1
     assert "thinking only" in str(corrections[0].details)
+
+    await session.aclose()
+
+
+async def test_truncated_turn_warns_and_leaves_the_continue_to_core(tmp_path: Path) -> None:
+    # Division of labor on a `length` stop: the guard says what happened, core makes
+    # the room and resumes. A correction from the guard here would be truncated the
+    # same way the original turn was.
+    truncated = AssistantMessage(
+        model="fake",
+        content=[ThinkingContent(thinking="Planning the rest of the report")],
+    )
+    provider = FakeProvider(
+        [_stream(truncated, finish_reason="length"), _stream(_answer("Finished the report."))]
+    )
+    session, ui = await _load_session(tmp_path, provider)
+
+    _ = [event async for event in session.prompt("Write the long report")]
+
+    assert len(provider.calls) == 2
+    assert _corrections(session.messages) == []
+    assert [
+        message
+        for message, level in ui.notifications
+        if level == "warning" and "truncated" in message
+    ] == [TRUNCATION_WARNING]
+    assert "Finished the report." in [message.text for message in session.messages]
 
     await session.aclose()
 
@@ -497,6 +530,35 @@ async def test_error_and_aborted_turns_are_left_to_tau_retries(tmp_path: Path) -
         )
 
     assert session.queued == []
+
+
+async def test_length_stop_is_never_rescued(tmp_path: Path) -> None:
+    # `length` means the provider ran out of room mid-response, so the turn looks
+    # stalled (thinking only, no call) while the cause is the opposite of a stall.
+    # Retrying it spends a request on the same truncation, or gets a context-overflow
+    # rejection when the window was the limit.
+    runtime, session = _bound_runtime(tmp_path)
+    ui = RecordingUiBridge()
+    runtime.set_ui_bridge(ui)
+
+    await runtime.emit_event(
+        _turn_end(
+            AssistantMessage(
+                model="fake",
+                content=[ThinkingContent(thinking="Planning the rest of the report")],
+                stop_reason="length",
+            )
+        )
+    )
+    # Even leaked markup is left alone once the stop reason says the turn was cut
+    # off: the pattern is not the problem the provider reported.
+    await runtime.emit_event(
+        _turn_end(AssistantMessage(model="fake", content=LEAKED_REPLY, stop_reason="length"))
+    )
+
+    assert session.queued == []
+    assert [level for _, level in ui.notifications] == ["warning", "warning"]
+    assert {message for message, _ in ui.notifications} == {TRUNCATION_WARNING}
 
 
 async def test_turn_with_tool_results_is_not_rescued(tmp_path: Path) -> None:

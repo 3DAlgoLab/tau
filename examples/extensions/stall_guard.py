@@ -12,6 +12,16 @@ At the settlement boundary this guard inspects the assistant message that ends
 the turn and, for those three shapes, injects one corrective message so the run
 makes exactly one more model request -- bounded per run and per session.
 
+A ``length`` stop is deliberately never retried. That stop means the provider
+truncated the response at its token budget -- usually because the prompt nearly
+fills the context window -- so another request only adds tokens to an already
+full prompt. Observed live: a thinking-only turn at 131,064 of 131,072 tokens
+was "recovered" this way and the retry was rejected with HTTP 400 ("request
+exceeds the context window"). Truncation needs room, and the session owns that:
+when a run settles on a truncated turn that produced nothing visible, Tau
+compacts and continues it once. This guard's part is to say out loud what the
+silent stop meant, never to add tokens to it.
+
 Tau has no Pi-style ``agent_before_settle`` decision hook. The boundary here is
 the ``turn_end`` of a turn whose assistant message requested no tool call:
 ``run_agent_loop`` has emitted that turn but has not yet drained its follow-up
@@ -74,7 +84,14 @@ def _prose_length(text: str) -> int:
 
 
 def _stall_reason(message: AssistantMessage) -> str | None:
-    """Return why this settled assistant turn looks like a stalled call."""
+    """Return why this settled assistant turn looks like a stalled call.
+
+    ``error``/``aborted``/``length`` are excluded up front: none of them is a
+    stall, and a correction cannot fix a provider-side truncation. Retrying a
+    full context is what turns a silent truncation into a 400 context overflow.
+    """
+    if message.stop_reason in {"error", "aborted", "length"}:
+        return None
     text = message.text
     leaked = LEAKED_MARKUP.search(_strip_code(text)) is not None and (
         _prose_length(text) <= PROSE_OVERRIDE_CHARS
@@ -167,13 +184,27 @@ def setup(tau: ExtensionAPI) -> None:
         message = event.message
         if not isinstance(message, AssistantMessage) or event.tool_results:
             return
-        if message.tool_calls or message.stop_reason in {"error", "aborted"}:
+        if message.tool_calls:
             return
         # A queued message already resumes the run on its own, so there is
         # nothing to rescue; Tau emits no event when the loop drains it.
         if budget.pending_queued > 0:
             return
+        if message.stop_reason == "length":
+            # Truncation is not a stall and no retry can fix it: the provider
+            # cut the response at its token budget, usually because the prompt
+            # nearly fills the context window. The session compacts and continues
+            # a truncated turn that showed nothing, so explain the silent stop
+            # instead of adding tokens to it.
+            context.ui.notify(
+                "stall-guard: response truncated at the token limit; "
+                "not retrying (Tau will compact context instead)",
+                "warning",
+            )
+            return
 
+        # `_stall_reason` also refuses `length`; the remaining stop-reason
+        # policy (error/aborted) lives there so classifier and tests agree.
         reason = _stall_reason(message)
         if reason is None:
             return
