@@ -354,6 +354,7 @@ class ProviderSettings:
         default_factory=lambda: builtin_provider_configs()
     )
     scoped_models: tuple[ScopedModelConfig, ...] = ()
+    last_model: ScopedModelConfig | None = None
 
     def get_provider(self, name: str | None = None) -> ProviderConfig:
         """Return a configured provider by name."""
@@ -372,6 +373,7 @@ class ProviderSettings:
                 provider.name: _provider_preference_to_json(provider) for provider in self.providers
             },
             "scoped_models": [model.to_json() for model in self.scoped_models],
+            **({"last_model": self.last_model.to_json()} if self.last_model else {}),
         }
 
 
@@ -546,6 +548,49 @@ def save_default_provider_model(
     return updated
 
 
+def set_last_provider_model(
+    settings: ProviderSettings,
+    *,
+    provider_name: str,
+    model: str,
+) -> ProviderSettings:
+    """Return settings with the remembered provider/model pair updated.
+
+    The pair is a preference, not a provider definition, so it may name an
+    account-scoped model that must never reach catalog.toml — the same reason
+    `scoped_models` stores bare pairs. The provider still has to exist: a pair
+    whose provider vanished is repaired on read, but recording one here would
+    just preserve the damage.
+    """
+    settings.get_provider(provider_name)
+    return replace(settings, last_model=ScopedModelConfig(provider=provider_name, model=model))
+
+
+def save_model_choice(
+    *,
+    provider_name: str,
+    model: str,
+    paths: TauPaths | None = None,
+    fallback_settings: ProviderSettings | None = None,
+) -> ProviderSettings:
+    """Persist one model choice as one read-modify-write of durable settings.
+
+    The remembered pair always lands in the preferences file. The provider
+    default is catalog-backed, so it moves only when this model is declared
+    there — account-scoped inventory must not be written into catalog.toml. Both
+    updates share a single load and save: a second load would re-read the file the
+    first save just wrote, and a provider that exists only in the caller's inline
+    settings is not on disk yet, so it would silently fall back to the built-in
+    catalog.
+    """
+    settings = _load_provider_settings_for_write(paths, fallback_settings=fallback_settings)
+    updated = set_last_provider_model(settings, provider_name=provider_name, model=model)
+    if model in updated.get_provider(provider_name).models:
+        updated = set_default_provider_model(updated, provider_name=provider_name, model=model)
+    save_provider_settings(updated, paths)
+    return updated
+
+
 def save_provider_thinking_level(
     *,
     provider_name: str,
@@ -656,11 +701,7 @@ def set_default_provider_model(
     providers = tuple(
         updated_provider if item.name == provider_name else item for item in settings.providers
     )
-    return ProviderSettings(
-        default_provider=provider_name,
-        providers=providers,
-        scoped_models=settings.scoped_models,
-    )
+    return replace(settings, default_provider=provider_name, providers=providers)
 
 
 def set_provider_thinking_level(
@@ -688,11 +729,7 @@ def set_provider_thinking_level(
     providers = tuple(
         updated_provider if item.name == provider_name else item for item in settings.providers
     )
-    return ProviderSettings(
-        default_provider=settings.default_provider,
-        providers=providers,
-        scoped_models=settings.scoped_models,
-    )
+    return replace(settings, providers=providers)
 
 
 def upsert_openai_compatible_provider(
@@ -719,11 +756,7 @@ def upsert_provider(
     providers_by_name[provider.name] = provider
     default_provider = provider.name if set_default else settings.default_provider
     providers = tuple(providers_by_name[name] for name in sorted(providers_by_name))
-    updated = ProviderSettings(
-        default_provider=default_provider,
-        providers=providers,
-        scoped_models=settings.scoped_models,
-    )
+    updated = replace(settings, default_provider=default_provider, providers=providers)
     updated.get_provider(default_provider)
     return updated
 
@@ -745,11 +778,7 @@ def _with_builtin_catalog_models(
     default_provider = settings.default_provider
     if default_provider not in {provider.name for provider in providers}:
         default_provider = providers[0].name if providers else DEFAULT_PROVIDER_NAME
-    return ProviderSettings(
-        default_provider=default_provider,
-        providers=providers,
-        scoped_models=settings.scoped_models,
-    )
+    return replace(settings, default_provider=default_provider, providers=providers)
 
 
 def _migrate_legacy_provider_settings(
@@ -787,7 +816,8 @@ def _migrate_legacy_provider_settings(
     default_provider = settings.default_provider
     if default_provider not in names:
         default_provider = merged[0].name if merged else DEFAULT_PROVIDER_NAME
-    return ProviderSettings(
+    return replace(
+        settings,
         default_provider=default_provider,
         providers=merged,
         scoped_models=tuple(
@@ -1225,6 +1255,7 @@ def provider_settings_from_json(
         )
     default_provider = _string(data.get("default_provider"), "default_provider")
     scoped_models = _scoped_models_from_json(data.get("scoped_models"))
+    last_model = _last_model_from_json(data.get("last_model"))
     if "provider_preferences" in data:
         providers = _providers_with_preferences(
             data.get("provider_preferences"),
@@ -1234,6 +1265,7 @@ def provider_settings_from_json(
             default_provider=default_provider,
             providers=providers,
             scoped_models=scoped_models,
+            last_model=last_model,
         )
 
     providers_data = data.get("providers")
@@ -1249,6 +1281,7 @@ def provider_settings_from_json(
         default_provider=default_provider,
         providers=providers,
         scoped_models=scoped_models,
+        last_model=last_model,
     )
 
 
@@ -1441,13 +1474,53 @@ def _scoped_models_from_json(value: object) -> tuple[ScopedModelConfig, ...]:
     return tuple(scoped)
 
 
+def _last_model_from_json(value: object) -> ScopedModelConfig | None:
+    """Parse the remembered provider/model pair.
+
+    Deliberately forgiving: a malformed or future-shaped value means "no memory"
+    rather than an unstartable install, the same way unknown top-level settings
+    fields are ignored on read.
+    """
+    if not isinstance(value, dict):
+        return None
+    provider = value.get("provider")
+    model = value.get("model")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return ScopedModelConfig(provider=provider.strip(), model=model.strip())
+
+
 def resolve_provider_selection(
     settings: ProviderSettings,
     *,
     provider_name: str | None = None,
     model: str | None = None,
 ) -> ProviderSelection:
-    """Resolve the provider and model for a run."""
+    """Resolve the provider and model for a run.
+
+    An explicit model wins outright. Otherwise the pair the user last selected is
+    preferred over the provider's configured default, so a new session and a fresh
+    launch both start where the previous one left off. Asking for a provider keeps
+    the choice inside that provider: its remembered model is used when it has one,
+    and its configured default otherwise. A remembered pair this settings snapshot
+    cannot name (a removed provider, an account-scoped model absent from the
+    catalog) is skipped rather than raising: the default is a working answer, a
+    startup failure is not.
+    """
+    remembered = settings.last_model
+    if model is None and remembered is not None:
+        try:
+            remembered_provider = settings.get_provider(provider_name or remembered.provider)
+        except ProviderConfigError:
+            remembered_provider = None
+        if (
+            remembered_provider is not None
+            and remembered_provider.name == remembered.provider
+            and remembered.model in remembered_provider.models
+        ):
+            return ProviderSelection(provider=remembered_provider, model=remembered.model)
     provider = settings.get_provider(provider_name)
     selected_model = model or provider.default_model
     if not selected_model:

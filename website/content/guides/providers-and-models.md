@@ -385,6 +385,16 @@ separate `openai-codex` subscription provider.
 When a switch crosses provider APIs, Tau compiles existing tool history for the
 target provider. Provider-specific tool-call IDs are deterministically translated
 to a portable format, with the same translated ID used for each call and result.
+
+Choosing a model also records it as the pair Tau starts with next. A fresh launch
+resolves to the model you last chose instead of a provider's configured default,
+and `/new` keeps the model actually running rather than falling back to a default
+that may name something else. A launch request still wins: `-m <model>` picks the
+model, and `--provider <name>` keeps the choice inside that provider (its own
+remembered model if it has one, otherwise its configured default). A remembered
+pair this install cannot name — a removed provider, or an account-scoped model
+that is not in the catalog — is skipped in favour of the configured default, so
+remembering never turns into a startup error.
 When compiling history for Anthropic, Tau also omits opaque reasoning signatures
 created by other APIs. This lets a session continue after tools have run without
 exposing users to provider validation errors or rewriting the saved JSONL history.

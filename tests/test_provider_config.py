@@ -28,8 +28,10 @@ from tau_coding.provider_config import (
     provider_thinking_unavailable_reason,
     resolve_provider_selection,
     resolve_startup_thinking_level,
+    save_model_choice,
     save_provider_settings,
     set_default_provider_model,
+    set_last_provider_model,
     set_provider_thinking_level,
     upsert_openai_compatible_provider,
 )
@@ -748,6 +750,150 @@ def test_resolve_provider_selection_uses_configured_defaults() -> None:
 def test_resolve_provider_selection_rejects_unknown_provider() -> None:
     with pytest.raises(ProviderConfigError, match="Unknown provider"):
         resolve_provider_selection(ProviderSettings(), provider_name="missing")
+
+
+def _local_settings(*, last_model: ScopedModelConfig | None = None) -> ProviderSettings:
+    return ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="LOCAL_API_KEY",
+                models=("qwen", "llama"),
+                default_model="qwen",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="hosted",
+                base_url="https://hosted.example/v1",
+                api_key_env="HOSTED_API_KEY",
+                models=("frontier-1",),
+                default_model="frontier-1",
+            ),
+        ),
+        last_model=last_model,
+    )
+
+
+def test_resolve_provider_selection_prefers_the_last_used_model() -> None:
+    settings = _local_settings(last_model=ScopedModelConfig(provider="hosted", model="frontier-1"))
+
+    selection = resolve_provider_selection(settings)
+
+    assert (selection.provider.name, selection.model) == ("hosted", "frontier-1")
+
+
+def test_resolve_provider_selection_keeps_explicit_requests_ahead_of_memory() -> None:
+    settings = _local_settings(last_model=ScopedModelConfig(provider="hosted", model="frontier-1"))
+
+    assert resolve_provider_selection(settings, model="llama").model == "llama"
+    assert resolve_provider_selection(settings, provider_name="local").provider.name == "local"
+
+
+def test_resolve_provider_selection_keeps_a_provider_request_inside_that_provider() -> None:
+    # A provider request narrows the choice to that provider: its own memory if it
+    # has one, its configured default otherwise.
+    other_memory = _local_settings(
+        last_model=ScopedModelConfig(provider="hosted", model="frontier-1")
+    )
+    same_memory = _local_settings(last_model=ScopedModelConfig(provider="local", model="llama"))
+
+    assert resolve_provider_selection(other_memory, provider_name="local").model == "qwen"
+    assert resolve_provider_selection(same_memory, provider_name="local").model == "llama"
+
+
+def test_resolve_provider_selection_ignores_memory_it_cannot_name() -> None:
+    """A removed provider or a model this catalog no longer lists must not start a run."""
+    removed_provider = _local_settings(
+        last_model=ScopedModelConfig(provider="gone", model="frontier-1")
+    )
+    removed_model = _local_settings(last_model=ScopedModelConfig(provider="local", model="qwen-0"))
+
+    for settings in (removed_provider, removed_model):
+        selection = resolve_provider_selection(settings)
+        assert (selection.provider.name, selection.model) == ("local", "qwen")
+
+
+def test_provider_settings_round_trip_preserves_last_model(tmp_path: Path) -> None:
+    paths = TauPaths(home=tmp_path / ".tau")
+    settings = _local_settings(last_model=ScopedModelConfig(provider="local", model="llama"))
+
+    save_provider_settings(settings, paths)
+    loaded = load_provider_settings(paths)
+
+    assert loaded.last_model == ScopedModelConfig(provider="local", model="llama")
+    assert loaded.to_json()["last_model"] == {"provider": "local", "model": "llama"}
+
+
+def test_provider_settings_omit_last_model_when_unset(tmp_path: Path) -> None:
+    saved = save_provider_settings(_local_settings(), TauPaths(home=tmp_path / ".tau"))
+
+    assert "last_model" not in json.loads(saved.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "local/llama",
+        {"provider": "local"},
+        {"model": "llama"},
+        {"provider": "", "model": " "},
+    ],
+)
+def test_provider_settings_from_json_ignores_malformed_last_model(payload: object) -> None:
+    settings = provider_settings_from_json(
+        {
+            "schema_version": 2,
+            "default_provider": "local",
+            "provider_preferences": {"local": {"models": ["qwen"], "default_model": "qwen"}},
+            "last_model": payload,
+        }
+    )
+
+    assert settings.last_model is None
+
+
+def test_set_last_provider_model_rejects_an_unknown_provider() -> None:
+    with pytest.raises(ProviderConfigError, match="Unknown provider"):
+        set_last_provider_model(_local_settings(), provider_name="gone", model="frontier-1")
+
+
+def test_save_model_choice_remembers_models_the_catalog_cannot_name(tmp_path: Path) -> None:
+    """Account-scoped models live outside catalog.toml but still set the memory.
+
+    The provider default is a catalog-backed value, so it stays put; the
+    remembered pair is a preference and carries the account-specific id.
+    """
+    paths = TauPaths(home=tmp_path / ".tau")
+
+    updated = save_model_choice(
+        provider_name="local",
+        model="qwen-nightly",
+        paths=paths,
+        fallback_settings=_local_settings(),
+    )
+
+    assert updated.last_model == ScopedModelConfig(provider="local", model="qwen-nightly")
+    assert updated.get_provider("local").default_model == "qwen"
+    reloaded = load_provider_settings(paths)
+    assert reloaded.last_model == ScopedModelConfig(provider="local", model="qwen-nightly")
+    assert reloaded.get_provider("local").default_model == "qwen"
+
+
+def test_save_model_choice_moves_the_default_for_declared_models(tmp_path: Path) -> None:
+    paths = TauPaths(home=tmp_path / ".tau")
+
+    updated = save_model_choice(
+        provider_name="local",
+        model="llama",
+        paths=paths,
+        fallback_settings=_local_settings(),
+    )
+
+    assert updated.last_model == ScopedModelConfig(provider="local", model="llama")
+    assert updated.get_provider("local").default_model == "llama"
+    assert resolve_provider_selection(load_provider_settings(paths)).model == "llama"
 
 
 def _kimi_code_like_provider() -> OpenAICompatibleProviderConfig:

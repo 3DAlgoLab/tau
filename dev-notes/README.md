@@ -28,6 +28,9 @@ User-facing documentation lives in `website/content/` and is published at
   `finishReason` before Tau reports successful completion.
 - `startup-thinking-level-fallback.md` — why startup resolves a valid thinking
   level per model instead of assuming the global `medium` default.
+- `last-model-starting-model.md` — why a fresh launch and `/new` start on the
+  model actually in use, and why that memory is a `providers.json` preference
+  rather than a `catalog.toml` default.
 - `models-dev-catalog.md` — Pi-compatible build-time models.dev catalog
   generation, offline fallback, and snapshot refresh workflow.
 - `llama-cpp-phase-5.md` — built-in llama.cpp connection, safe state, `/local`,

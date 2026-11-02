@@ -66,6 +66,7 @@ from tau_coding import (
     TauPaths,
     TauResourcePaths,
     load_provider_settings,
+    resolve_provider_selection,
     save_provider_settings,
 )
 from tau_coding import session as coding_session_module
@@ -6512,9 +6513,10 @@ async def test_session_set_model_preserves_newer_provider_file_changes(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("owns_initial_provider", [False, True])
-async def test_session_new_session_uses_default_provider_model(
+async def test_session_new_session_starts_on_the_model_in_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owns_initial_provider: bool
 ) -> None:
+    """`/new` continues the model actually running, not a default left behind."""
     manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
     current_record = manager.create_session(
         cwd=tmp_path,
@@ -6574,12 +6576,123 @@ async def test_session_new_session_uses_default_provider_model(
     message = await session.new_session()
 
     assert message.startswith("Started new session: ")
+    assert session.provider_name == "openrouter"
+    assert session.model == "openai/gpt-5.5"
+    assert manager.get_session(session.session_id) is None
+    assert created == [("openrouter", "openai/gpt-5.5")]
+    assert session.provider is not old_provider
+    assert session.provider.config.name == "openrouter"
+
+
+@pytest.mark.anyio
+async def test_model_switch_is_remembered_for_the_next_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pair in use is written to preferences, so the next run resolves to it."""
+    isolate_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    monkeypatch.setattr(
+        coding_session_module,
+        "create_model_provider",
+        lambda provider_config, **_kwargs: SwitchableFakeProvider(provider_config),
+    )
+    settings = ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="LOCAL_API_KEY",
+                models=("qwen", "llama"),
+                default_model="qwen",
+            ),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider([]),
+            model="qwen",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "remember.jsonl"),
+            cwd=tmp_path,
+            provider_name="local",
+            provider_settings=settings,
+        )
+    )
+
+    session.set_model("llama")
+
+    saved = load_provider_settings(TauPaths())
+    assert saved.last_model == ScopedModelConfig(provider="local", model="llama")
+    assert resolve_provider_selection(saved).model == "llama"
+
+
+@pytest.mark.anyio
+async def test_session_new_session_falls_back_when_durable_settings_cannot_name_the_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider the durable settings cannot name must not strand `/new`: it resolves normally."""
+    manager = SessionManager(TauPaths(home=tmp_path / ".tau", agents_home=tmp_path / ".agents"))
+    current_record = manager.create_session(
+        cwd=tmp_path,
+        model="openrouter-preview",
+        provider_name="openrouter",
+    )
+    settings = ProviderSettings(
+        default_provider="openai",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="openai",
+                models=("gpt-5",),
+                default_model="gpt-5",
+            ),
+        ),
+    )
+    # The running provider/model exists only in the live runtime, not in the
+    # durable settings this session resolved from.
+    live_openrouter = OpenAICompatibleProviderConfig(
+        name="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        models=("openrouter-preview",),
+        default_model="openrouter-preview",
+    )
+    created: list[tuple[str, str | None]] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+        inference_provider: str | None = None,
+    ) -> SwitchableFakeProvider:
+        del credential_store, thinking_level, inference_provider
+        created.append((provider_config.name, model))  # type: ignore[attr-defined]
+        return SwitchableFakeProvider(provider_config)
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=SwitchableFakeProvider(live_openrouter),
+            model="openrouter-preview",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(current_record.path),
+            cwd=current_record.cwd,
+            session_id=current_record.id,
+            session_manager=manager,
+            provider_name="openrouter",
+            provider_settings=settings,
+            runtime_provider_config=live_openrouter,
+        )
+    )
+    created.clear()
+
+    await session.new_session()
+
     assert session.provider_name == "openai"
     assert session.model == "gpt-5"
-    assert manager.get_session(session.session_id) is None
     assert created == [("openai", "gpt-5")]
-    assert session.provider is not old_provider
-    assert session.provider.config.name == "openai"
 
 
 @pytest.mark.anyio
@@ -7196,3 +7309,5 @@ async def test_dynamic_provider_rejects_unsupported_thinking_override(
         await CodingSession.load(
             _dynamic_thinking_override_config(tmp_path, thinking_level_override="max")
         )
+
+

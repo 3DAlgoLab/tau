@@ -109,6 +109,7 @@ from tau_coding.provider_config import (
     ProviderConfig,
     ProviderConfigError,
     ProviderModelMetadata,
+    ProviderSelection,
     ProviderSettings,
     load_provider_settings,
     provider_default_thinking_level,
@@ -118,7 +119,7 @@ from tau_coding.provider_config import (
     provider_thinking_unavailable_reason,
     resolve_provider_selection,
     resolve_startup_thinking_level,
-    save_default_provider_model,
+    save_model_choice,
     save_provider_thinking_level,
     toggle_saved_scoped_model,
     toggle_saved_stable_scoped_model,
@@ -1577,7 +1578,7 @@ class CodingSession:
         self._sync_thinking_level_to_active_model()
         self._refresh_runtime_provider()
         self._sync_image_support()
-        self._persist_default_model_choice()
+        self._persist_model_choice()
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -1746,7 +1747,7 @@ class CodingSession:
             with suppress(Exception):
                 await self._close_replaced_provider(old_provider)
         if selected_config is not None and persist_default:
-            self._persist_default_model_choice()
+            self._persist_model_choice()
         return ModelSelectionResult(choice, changed=True)
 
     def set_inference_provider(self, route: str | None) -> str:
@@ -2001,7 +2002,7 @@ class CodingSession:
         self._thinking_level = thinking_level
         self._sync_image_support()
         if persist_default:
-            self._persist_default_model_choice()
+            self._persist_model_choice()
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -2143,14 +2144,17 @@ class CodingSession:
             else None
         )
 
-    def _persist_default_model_choice(self) -> None:
+    def _persist_model_choice(self) -> None:
+        """Remember the provider/model this session now runs on.
+
+        One read-modify-write behind `save_model_choice`: the remembered pair
+        covers every model, including account-scoped ones, and is what lets a new
+        session or the next launch start where this one left off, while the
+        catalog-backed provider default moves only for models the catalog knows.
+        """
         if self._durable_provider_settings is None:
             return
-        durable_provider = self._durable_provider_settings.get_provider(self.provider_name)
-        if self.model not in durable_provider.models:
-            # Account-specific inventory is deliberately not written into catalog.toml.
-            return
-        self._durable_provider_settings = save_default_provider_model(
+        self._durable_provider_settings = save_model_choice(
             provider_name=self.provider_name,
             model=self.model,
             paths=self._resource_paths.paths,
@@ -2158,6 +2162,27 @@ class CodingSession:
         )
         self._apply_runtime_model_catalogs()
         self._sync_thinking_level_to_active_model()
+
+    def _carried_session_selection(self) -> ProviderSelection | None:
+        """Return the provider/model a new session may carry over, when it may.
+
+        The pair this session actually runs on wins while it is still nameable:
+        declared in durable settings, or offered by the live registry for a
+        dynamic provider whose inventory is account-scoped. Carrying it is what
+        makes `/new` continue the model in use instead of dropping back to a
+        catalog default the user stopped choosing; anything the settings
+        snapshot cannot name falls through to the ordinary resolution.
+        """
+        settings = self._provider_settings
+        if settings is None:
+            return None
+        try:
+            provider = settings.get_provider(self.provider_name)
+        except ProviderConfigError:
+            return None
+        if self.model in provider.models or self._active_dynamic_model is not None:
+            return ProviderSelection(provider=provider, model=self.model)
+        return None
 
     def _persist_thinking_level_choice(self) -> None:
         if self._provider_settings is None:
@@ -2936,7 +2961,9 @@ class CodingSession:
         runtime_provider_config = self._runtime_provider_config
         thinking_level = self._thinking_level
         if self._provider_settings is not None:
-            selection = resolve_provider_selection(self._provider_settings)
+            selection = self._carried_session_selection() or resolve_provider_selection(
+                self._provider_settings
+            )
             provider_name = selection.provider.name
             model = selection.model
             runtime_provider_config = selection.provider
