@@ -834,6 +834,10 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
   retries, bounded per run and per session; `/stall-guard` shows or resets the
   budget.
 - **`sidebar_status.py`** — adds and updates a host-framed sidebar section.
+- **`python_kernel.py`** — adds a `python` tool backed by one interpreter that
+  stays alive for the session, so imports, data, and live handles carry between
+  cells; cells are capped, cut by an optional deadline (interrupt, then kill),
+  and `/python` reports or resets the kernel.
 - **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
 
 A larger, real-world extension lives in its own repository:

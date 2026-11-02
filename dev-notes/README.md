@@ -37,6 +37,9 @@ User-facing documentation lives in `website/content/` and is published at
 - `stall-guard-extension.md` — how the shipped `stall_guard` example rescues a
   turn that ended with no tool call, and why inline agent-event dispatch makes a
   queued follow-up continue the same run.
+- `python-kernel-extension.md` — how the shipped `python_kernel` example keeps one
+  live interpreter per session, and why its interrupt ladder is SIGINT-then-kill
+  instead of a Jupyter control channel.
 - `tui-latency-fixes.md` — profiled causes of slow prompt echo and startup, and
   the stamp-validated caches and scheduling changes that fixed them.
 

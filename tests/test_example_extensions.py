@@ -92,6 +92,7 @@ def test_shipped_examples_load(tmp_path: Path) -> None:
         "hello_tool.py",
         "permission_gate.py",
         "prompt_section.py",
+        "python_kernel.py",
         "sidebar_status.py",
         "stall_guard.py",
     )
@@ -101,12 +102,14 @@ def test_shipped_examples_load(tmp_path: Path) -> None:
         "hello_tool",
         "permission_gate",
         "prompt_section",
+        "python_kernel",
         "sidebar_status",
         "stall_guard",
     )
     assert [tool.name for tool in runtime.extension_tools] == [
         "ask_user_question",
         "hello",
+        "python",
     ]
     assert runtime.prompt_sections[0].title == "Review procedure"
     assert "```bash" in runtime.prompt_sections[0].body
