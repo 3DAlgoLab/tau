@@ -1529,6 +1529,95 @@ def resolve_provider_selection(
     return ProviderSelection(provider=provider, model=selected_model)
 
 
+def resolve_startup_provider_selection(
+    settings: ProviderSettings,
+    *,
+    credential_reader: CredentialReader | None = None,
+) -> ProviderSelection:
+    """Resolve the pair a fresh session starts on, keeping it servable.
+
+    Same precedence as `resolve_provider_selection`, then a credential check: when
+    the resolved provider has no usable credential, candidates are walked in the
+    order that records past choice — the remembered pair, then saved scoped models
+    in the order they were saved, then provider defaults in provider order — and
+    the first one Tau can authenticate wins. Provider order alone used to decide
+    this, so an unrelated provider could take the startup slot just because it
+    sorted first and had an environment key the user never chose.
+
+    With nothing usable at all the plain resolution is returned unchanged: the
+    resulting failure then names the provider the user configured instead of an
+    arbitrary substitute, which is the message worth reading.
+    """
+    reader = credential_reader if credential_reader is not None else FileCredentialStore()
+    selection = resolve_provider_selection(settings)
+    if provider_has_usable_credentials(selection.provider, credential_reader=reader):
+        return selection
+    return _first_usable_provider_selection(settings, credential_reader=reader) or selection
+
+
+def _first_usable_provider_selection(
+    settings: ProviderSettings,
+    *,
+    credential_reader: CredentialReader,
+) -> ProviderSelection | None:
+    """Return the first candidate pair Tau can authenticate."""
+    for provider, model in _provider_selection_candidates(
+        settings,
+        credential_reader=credential_reader,
+    ):
+        if provider_has_usable_credentials(provider, credential_reader=credential_reader):
+            return ProviderSelection(provider=provider, model=model)
+    return None
+
+
+def _provider_selection_candidates(
+    settings: ProviderSettings,
+    *,
+    credential_reader: CredentialReader,
+) -> tuple[tuple[ProviderConfig, str], ...]:
+    """Order fallback candidates by how directly they record past user choice."""
+    candidates: list[tuple[ProviderConfig, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def offer(provider: ProviderConfig, model: str) -> None:
+        key = (provider.name, model)
+        if key not in seen:
+            seen.add(key)
+            candidates.append((provider, model))
+
+    remembered = settings.last_model
+    remembered_provider = _declared_provider(settings, remembered.provider) if remembered else None
+    if (
+        remembered is not None
+        and remembered_provider is not None
+        and remembered.model in remembered_provider.models
+    ):
+        offer(remembered_provider, remembered.model)
+
+    for scoped in settings.scoped_models:
+        provider = _declared_provider(settings, scoped.provider)
+        if provider is None or scoped.model not in provider.models:
+            continue
+        offer(provider, scoped.model)
+
+    for provider in settings.providers:
+        if provider.default_model:
+            offer(provider, provider.default_model)
+
+    return tuple(candidates)
+
+
+def _declared_provider(settings: ProviderSettings, name: object) -> ProviderConfig | None:
+    """Return a named provider, or None when these settings cannot name it."""
+    if not isinstance(name, str):
+        return None
+    try:
+        provider = settings.get_provider(name)
+    except ProviderConfigError:
+        return None
+    return provider if provider.name == name else None
+
+
 def validate_provider_model(provider: ProviderConfig, model: str) -> None:
     """Raise when ``model`` is not declared by ``provider``."""
     if model in provider.models:

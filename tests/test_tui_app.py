@@ -193,6 +193,7 @@ from tau_coding.tui.widgets import (
     render_session_sidebar,
     transcript_item_selection_text,
 )
+from tau_coding.version import current_version
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -978,7 +979,7 @@ def test_session_sidebar_brand_includes_current_version() -> None:
 
     console.print(_sidebar_brand(theme=TAU_DARK_THEME))
 
-    assert "τ = 2π  0.4.8" in console.export_text()
+    assert f"τ = 2π  {current_version()}" in console.export_text()
 
 
 def test_session_sidebar_uses_prominent_title_and_accented_section_headers() -> None:
@@ -11809,8 +11810,22 @@ async def test_run_tui_app_opens_when_provider_login_is_missing(
         async def run_async(self) -> None:
             calls.append("run")
 
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: ProviderSettings())
-    monkeypatch.setattr(tui_app, "provider_has_usable_credentials", lambda *args, **kwargs: False)
+    # One provider behind a test-only key variable keeps the credential fallback
+    # from reaching whatever the developer's own environment happens to hold.
+    missing_key_settings = ProviderSettings(
+        default_provider="openai",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="openai",
+                api_key_env="RUN_TUI_LOGIN_MISSING_KEY",
+                credential_name="openai",
+                models=("gpt-5.4",),
+                default_model="gpt-5.4",
+            ),
+        ),
+    )
+    monkeypatch.delenv("RUN_TUI_LOGIN_MISSING_KEY", raising=False)
+    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: missing_key_settings)
     monkeypatch.setattr(
         tui_app,
         "create_model_provider",
@@ -12735,3 +12750,134 @@ async def test_tui_login_provider_search_autofocus() -> None:
 
         search = app.screen.query_one("#login-provider-search", Input)
         assert search.has_focus, "Search input failed to automatically gain focus on screen mount."
+
+
+class EmptyCredentialStore:
+    """Credential reader that finds nothing, so env keys decide usability."""
+
+    def get(self, name: str) -> str | None:
+        return None
+
+
+def _startup_fallback_settings(
+    *,
+    last_model: ScopedModelConfig | None = None,
+    scoped_models: tuple[ScopedModelConfig, ...] = (),
+) -> ProviderSettings:
+    """Settings with an alphabetically-early provider that has keys but is not used."""
+    return ProviderSettings(
+        default_provider="openai",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="anthropic",
+                base_url="http://localhost:1/v1",
+                api_key_env="STARTUP_ANTHROPIC_KEY",
+                credential_name=None,
+                models=("claude-sonnet",),
+                default_model="claude-sonnet",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="openai",
+                base_url="http://localhost:2/v1",
+                api_key_env="STARTUP_OPENAI_KEY",
+                credential_name=None,
+                models=("gpt-5.5",),
+                default_model="gpt-5.5",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="zeta",
+                base_url="http://localhost:3/v1",
+                api_key_env="STARTUP_ZETA_KEY",
+                credential_name=None,
+                models=("zeta-1", "zeta-2"),
+                default_model="zeta-1",
+            ),
+        ),
+        scoped_models=scoped_models,
+        last_model=last_model,
+    )
+
+
+def _prepare_startup_fallback_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the unused early provider a key while the configured default has none."""
+    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: EmptyCredentialStore())
+    monkeypatch.setenv("STARTUP_ANTHROPIC_KEY", "early-provider-key")
+    monkeypatch.setenv("STARTUP_ZETA_KEY", "saved-model-key")
+    monkeypatch.delenv("STARTUP_OPENAI_KEY", raising=False)
+
+
+def test_tui_startup_fallback_starts_on_the_last_used_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prepare_startup_fallback_env(monkeypatch)
+    settings = _startup_fallback_settings(last_model=ScopedModelConfig("zeta", "zeta-2"))
+
+    selection = tui_app._resolve_tui_startup_selection(
+        settings,
+        record=None,
+        provider_name=None,
+        model=None,
+        explicit_resume=False,
+    )
+
+    assert selection.provider.name == "zeta"
+    assert selection.model == "zeta-2"
+
+
+def test_tui_startup_fallback_prefers_a_saved_model_to_provider_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prepare_startup_fallback_env(monkeypatch)
+    settings = _startup_fallback_settings(
+        scoped_models=(ScopedModelConfig("zeta", "zeta-2"),),
+    )
+
+    selection = tui_app._resolve_tui_startup_selection(
+        settings,
+        record=None,
+        provider_name=None,
+        model=None,
+        explicit_resume=False,
+    )
+
+    assert selection.provider.name == "zeta"
+    assert selection.model == "zeta-2"
+
+
+def test_tui_startup_fallback_skips_a_remembered_provider_without_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prepare_startup_fallback_env(monkeypatch)
+    settings = _startup_fallback_settings(
+        last_model=ScopedModelConfig("openai", "gpt-5.5"),
+        scoped_models=(ScopedModelConfig("zeta", "zeta-2"),),
+    )
+
+    selection = tui_app._resolve_tui_startup_selection(
+        settings,
+        record=None,
+        provider_name=None,
+        model=None,
+        explicit_resume=False,
+    )
+
+    assert selection.provider.name == "zeta"
+    assert selection.model == "zeta-2"
+
+
+def test_tui_startup_fallback_uses_provider_order_without_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prepare_startup_fallback_env(monkeypatch)
+    settings = _startup_fallback_settings()
+
+    selection = tui_app._resolve_tui_startup_selection(
+        settings,
+        record=None,
+        provider_name=None,
+        model=None,
+        explicit_resume=False,
+    )
+
+    assert selection.provider.name == "anthropic"
+    assert selection.model == "claude-sonnet"

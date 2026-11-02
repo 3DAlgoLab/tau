@@ -126,6 +126,7 @@ from tau_coding.provider_config import (
     provider_config_from_catalog_entry,
     provider_has_usable_credentials,
     resolve_provider_selection,
+    resolve_startup_provider_selection,
     resolve_startup_thinking_level,
     save_provider_settings,
     upsert_openai_compatible_provider,
@@ -8799,23 +8800,10 @@ def _resolve_tui_startup_selection(
         if record_selection is not None:
             return record_selection
 
-    default_selection = resolve_provider_selection(settings)
-    if provider_has_usable_credentials(
-        default_selection.provider,
+    return resolve_startup_provider_selection(
+        settings,
         credential_reader=FileCredentialStore(),
-    ):
-        return default_selection
-
-    fallback_selection = _first_usable_startup_selection(settings)
-    return fallback_selection or default_selection
-
-
-def _first_usable_startup_selection(settings: Any) -> ProviderSelection | None:
-    credential_store = FileCredentialStore()
-    for provider in settings.providers:
-        if provider_has_usable_credentials(provider, credential_reader=credential_store):
-            return ProviderSelection(provider=provider, model=provider.default_model)
-    return None
+    )
 
 
 def _selection_from_session_record(settings: Any, record: Any | None) -> ProviderSelection | None:
@@ -8854,8 +8842,12 @@ def _selection_from_session_record(settings: Any, record: Any | None) -> Provide
     return None
 
 
-def _usable_scoped_startup_choices(settings: Any) -> tuple[ModelChoice, ...]:
-    credential_store = FileCredentialStore()
+def _usable_scoped_startup_choices(
+    settings: Any,
+    *,
+    credential_reader: Any | None = None,
+) -> tuple[ModelChoice, ...]:
+    credential_store = credential_reader if credential_reader is not None else FileCredentialStore()
     choices: list[ModelChoice] = []
     for item in settings.scoped_models:
         try:

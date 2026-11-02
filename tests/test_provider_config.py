@@ -27,6 +27,7 @@ from tau_coding.provider_config import (
     provider_thinking_levels,
     provider_thinking_unavailable_reason,
     resolve_provider_selection,
+    resolve_startup_provider_selection,
     resolve_startup_thinking_level,
     save_model_choice,
     save_provider_settings,
@@ -2050,3 +2051,124 @@ def test_openai_compatible_provider_config_rejects_invalid_retries() -> None:
         OpenAICompatibleProviderConfig(name="local", max_retries=-1)
     with pytest.raises(ProviderConfigError, match="0 or greater"):
         OpenAICompatibleProviderConfig(name="local", max_retry_delay_seconds=-1)
+
+
+def _startup_credential_settings(
+    *,
+    last_model: ScopedModelConfig | None = None,
+    scoped_models: tuple[ScopedModelConfig, ...] = (),
+) -> ProviderSettings:
+    """Settings where the configured default has no key and an early provider does."""
+    return ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="aaa",
+                base_url="http://localhost:1/v1",
+                api_key_env="STARTUP_AAA_KEY",
+                models=("early",),
+                default_model="early",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="STARTUP_LOCAL_KEY",
+                models=("qwen", "llama"),
+                default_model="qwen",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="zeta",
+                base_url="http://localhost:3/v1",
+                api_key_env="STARTUP_ZETA_KEY",
+                models=("zeta-1", "zeta-2"),
+                default_model="zeta-1",
+            ),
+        ),
+        scoped_models=scoped_models,
+        last_model=last_model,
+    )
+
+
+class _NoStoredCredentials:
+    """Credential reader that finds nothing, so environment keys decide."""
+
+    def get(self, name: str) -> str | None:
+        return None
+
+
+def _clear_startup_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("STARTUP_AAA_KEY", "STARTUP_LOCAL_KEY", "STARTUP_ZETA_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_resolve_startup_provider_selection_starts_on_the_last_used_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_startup_credential_env(monkeypatch)
+    monkeypatch.setenv("STARTUP_AAA_KEY", "early-key")
+    monkeypatch.setenv("STARTUP_ZETA_KEY", "saved-key")
+    settings = _startup_credential_settings(
+        last_model=ScopedModelConfig(provider="zeta", model="zeta-2")
+    )
+
+    selection = resolve_startup_provider_selection(
+        settings,
+        credential_reader=_NoStoredCredentials(),
+    )
+
+    assert (selection.provider.name, selection.model) == ("zeta", "zeta-2")
+
+
+def test_resolve_startup_provider_selection_prefers_a_saved_model_to_provider_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No memory yet, so the saved scoped model wins even though an earlier
+    # provider is credentialed and would have won under provider order.
+    _clear_startup_credential_env(monkeypatch)
+    monkeypatch.setenv("STARTUP_AAA_KEY", "early-key")
+    monkeypatch.setenv("STARTUP_ZETA_KEY", "saved-key")
+    settings = _startup_credential_settings(
+        scoped_models=(ScopedModelConfig(provider="zeta", model="zeta-2"),),
+    )
+
+    selection = resolve_startup_provider_selection(
+        settings,
+        credential_reader=_NoStoredCredentials(),
+    )
+
+    assert (selection.provider.name, selection.model) == ("zeta", "zeta-2")
+
+
+def test_resolve_startup_provider_selection_skips_memory_it_cannot_authenticate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_startup_credential_env(monkeypatch)
+    monkeypatch.setenv("STARTUP_AAA_KEY", "early-key")
+    settings = _startup_credential_settings(
+        last_model=ScopedModelConfig(provider="zeta", model="zeta-2")
+    )
+
+    selection = resolve_startup_provider_selection(
+        settings,
+        credential_reader=_NoStoredCredentials(),
+    )
+
+    assert (selection.provider.name, selection.model) == ("aaa", "early")
+
+
+def test_resolve_startup_provider_selection_keeps_the_default_without_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing is servable, so the configured provider is returned and its missing
+    # credential stays the reported failure instead of an arbitrary substitute.
+    _clear_startup_credential_env(monkeypatch)
+    settings = _startup_credential_settings(
+        scoped_models=(ScopedModelConfig(provider="zeta", model="zeta-2"),),
+    )
+
+    selection = resolve_startup_provider_selection(
+        settings,
+        credential_reader=_NoStoredCredentials(),
+    )
+
+    assert (selection.provider.name, selection.model) == ("local", "qwen")
