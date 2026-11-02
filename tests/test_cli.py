@@ -12,12 +12,13 @@ from tau_ai import (
     FakeProvider,
 )
 from tau_coding import CodingSessionRecord, SessionManager, cli
-from tau_coding.cli import app, run_print_mode
+from tau_coding.cli import _print_session_record, app, run_print_mode
 from tau_coding.clipboard import ClipboardOutcome
 from tau_coding.paths import TauPaths
 from tau_coding.provider_config import (
     OpenAICompatibleProviderConfig,
     ProviderSettings,
+    ScopedModelConfig,
     load_provider_settings,
 )
 from tau_coding.rendering import PrintOutputMode
@@ -2243,3 +2244,66 @@ def test_help_lists_thinking_option() -> None:
     output = re.sub(r"\s+", "", _strip_ansi(result.output))
     assert result.exit_code == 0
     assert "--thinking" in output
+
+
+def test_print_session_record_starts_headless_on_the_saved_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Headless runs with no stated preference honor saved model history."""
+
+    class EmptyCredentialStore:
+        def get(self, name: str) -> str | None:
+            return None
+
+    created: dict[str, object] = {}
+
+    class FakeManager:
+        def create_session_exclusive(self, **kwargs: object) -> object:
+            created.update(kwargs)
+            return kwargs
+
+    settings = ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="aaa",
+                base_url="http://localhost:1/v1",
+                api_key_env="HEADLESS_AAA_KEY",
+                models=("early",),
+                default_model="early",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="HEADLESS_LOCAL_KEY",
+                models=("qwen",),
+                default_model="qwen",
+            ),
+            OpenAICompatibleProviderConfig(
+                name="zeta",
+                base_url="http://localhost:3/v1",
+                api_key_env="HEADLESS_ZETA_KEY",
+                models=("zeta-1", "zeta-2"),
+                default_model="zeta-1",
+            ),
+        ),
+        scoped_models=(ScopedModelConfig(provider="zeta", model="zeta-2"),),
+        last_model=ScopedModelConfig(provider="zeta", model="zeta-2"),
+    )
+    monkeypatch.setattr("tau_coding.cli.FileCredentialStore", lambda: EmptyCredentialStore())
+    monkeypatch.setenv("HEADLESS_AAA_KEY", "early-key")
+    monkeypatch.setenv("HEADLESS_ZETA_KEY", "saved-key")
+    monkeypatch.delenv("HEADLESS_LOCAL_KEY", raising=False)
+
+    _print_session_record(
+        FakeManager(),
+        resume_session_id=None,
+        cwd=tmp_path,
+        settings=settings,
+        provider_name=None,
+        model=None,
+        session_id=None,
+    )
+
+    assert created["provider_name"] == "zeta"
+    assert created["model"] == "zeta-2"

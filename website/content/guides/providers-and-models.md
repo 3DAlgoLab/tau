@@ -395,6 +395,17 @@ remembered model if it has one, otherwise its configured default). A remembered
 pair this install cannot name — a removed provider, or an account-scoped model
 that is not in the catalog — is skipped in favour of the configured default, so
 remembering never turns into a startup error.
+
+If the resolved provider has no usable credential, Tau does not stop there. It
+walks candidates in the same spirit of past choice until it finds one it can
+authenticate: the remembered pair first, then your saved scoped models (`/scoped-models`)
+in the order they were saved, and only then provider defaults in provider order.
+The last tier is a last resort, so an unrelated provider that merely sorts first
+and happens to have an environment key no longer takes over a new session. Headless
+runs (`--print`, `--mode`, and RPC mode) resolve the same way, so a configured
+default with no credential in the environment does not hard-fail a script while an
+already-authenticated model sits unused. When no provider can be authenticated at
+all, Tau reports the configured default instead of substituting one.
 When compiling history for Anthropic, Tau also omits opaque reasoning signatures
 created by other APIs. This lets a session continue after tools have run without
 exposing users to provider validation errors or rewriting the saved JSONL history.

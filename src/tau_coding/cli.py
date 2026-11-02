@@ -45,6 +45,7 @@ from tau_coding.provider_config import (
     load_provider_settings,
     provider_kind,
     resolve_provider_selection,
+    resolve_startup_provider_selection,
     resolve_startup_thinking_level,
     save_provider_settings,
     upsert_openai_compatible_provider,
@@ -1092,7 +1093,10 @@ async def run_openai_print_mode(
     explicit_selection = provider_name is not None or model is not None
     selection = None
     if not explicit_selection and record.provider_name is None:
-        selection = resolve_provider_selection(settings)
+        selection = resolve_startup_provider_selection(
+            settings,
+            credential_reader=FileCredentialStore(),
+        )
     elif not explicit_selection and record.provider_name is not None:
         try:
             selection = resolve_provider_selection(
@@ -1224,7 +1228,18 @@ def _print_session_record(
         return record
 
     try:
-        selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
+        if provider_name is None and model is None:
+            # A headless run with no stated preference starts on the model in use,
+            # exactly like the TUI, instead of failing on a configured default that
+            # has no credential in this environment.
+            selection = resolve_startup_provider_selection(
+                settings,
+                credential_reader=FileCredentialStore(),
+            )
+        else:
+            selection = resolve_provider_selection(
+                settings, provider_name=provider_name, model=model
+            )
     except ProviderConfigError:
         if provider_name is None or model is None:
             raise
