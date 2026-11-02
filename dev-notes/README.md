@@ -44,6 +44,10 @@ User-facing documentation lives in `website/content/` and is published at
   live interpreter per session, why its interrupt ladder is SIGINT-then-kill
   instead of a Jupyter control channel, and why that interpreter is the project's
   own `.venv` rather than whatever Python Tau happens to run on.
+- `web-search-extension.md` — how the shipped `web_search` example reaches five
+  search backends and reads a page in reader mode, and why titles-only results,
+  a rejected key, and class-named page chrome each needed their own rule instead
+  of one generic "try the next provider" loop.
 - `copy-last-response-command.md` — how `/copy` splits "what to copy" from "how to
   reach this frontend's clipboard", and why the core helper never emits terminal
   escape codes.

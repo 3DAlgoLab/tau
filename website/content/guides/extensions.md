@@ -843,6 +843,15 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
   runs; `TAU_PY_VENV=prefer|require|off` tunes that and `/python venv` creates
   the venv with uv.
 - **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
+- **`web_search.py`** — adds `web_search` (ranked results, optional synthesized
+  answer) and `web_fetch` (reader-mode page text, paged by `offset`), plus
+  `/websearch` to show or clear state. Backends are tried in order — Serper,
+  Exa, Perplexity, Firecrawl, then keyless DuckDuckGo — using only the keys you
+  have (`SERPER_API_KEY`/`SERPER_DEV_API_KEY`, `EXA_API_KEY`, `PERPLEXITY_API_KEY`,
+  `FIRECRAWL_API_KEY`); a rejected key is skipped for a while instead of costing a
+  round-trip on every search, and a backend that returns only titles steps aside
+  for one that returns snippets. It needs no new packages, and it stays off until
+  you copy it into `~/.tau/extensions/` or pass it with `-e`.
 
 A larger, real-world extension lives in its own repository:
 [rian-dolphin/tau-subagents](https://github.com/rian-dolphin/tau-subagents)
