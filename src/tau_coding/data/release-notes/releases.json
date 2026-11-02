@@ -1,5 +1,23 @@
 [
   {
+    "version": "0.4.9b3",
+    "date": "2026-11-03",
+    "sections": {
+      "New": [
+        "Search the web and read a page back as agent tools with the `web_search` example extension (`web_search`, `web_fetch`).",
+        "Point the `python_kernel` example extension at the environment that fits the directory: the nearest `.venv` or `venv` when one exists, a project environment target when the folder only declares one (`pyproject.toml`, `uv.lock`, `requirements*.txt`), and one shared environment under `<TAU_HOME>/.venv` when the folder is no project at all."
+      ],
+      "Changed": [
+        "Automatic compaction is checked before every provider request, so one long run that chains tool calls can no longer climb into the model's hard context limit between prompt boundaries.",
+        "A context overflow is no longer recovered from only once: a continued run that overflows again compacts and retries again, up to a bounded number of recoveries per run."
+      ],
+      "Fixed": [
+        "Resume work when a run ends on a response the provider cut off with nothing visible to read. Tau now makes room by compacting and continues once, instead of sitting idle until you type `continue`.",
+        "The `stall_guard` example extension leaves truncated turns alone, so it no longer spends a retry on the same truncation or provokes a context-window rejection."
+      ]
+    }
+  },
+  {
     "version": "0.4.9b2",
     "date": "2026-11-02",
     "sections": {
