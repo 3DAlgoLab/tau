@@ -6,7 +6,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 from uuid import uuid4
 
 from tau_agent.messages import AgentMessage, ToolResultMessage
@@ -505,7 +505,11 @@ class ToolResultHookResult:
     details: dict[str, JSONValue] | None = None
 
 
-ExtensionHandler = Callable[[object, "ExtensionContext"], object | Awaitable[object]]
+# The event parameter is `Any` rather than `object` on purpose: the runtime dispatches the
+# payload type documented for each event name, and handlers are expected to annotate that
+# concrete type (`def on_turn_end(event: TurnEndEvent, context)`). A narrower parameter would
+# be rejected as contravariant otherwise, while arity still stays checked.
+ExtensionHandler = Callable[[Any, "ExtensionContext"], object | Awaitable[object]]
 # Command handlers are sync-only: the slash-command path (CommandRegistry ->
 # CodingSession.handle_command -> TUI submit) is synchronous end to end.
 ExtensionCommandHandler = Callable[["str", "ExtensionCommandContext"], "str | None"]
@@ -1135,6 +1139,12 @@ class ExtensionAPI:
             title,
             body,
         )
+
+    @overload
+    def on(self, event: str) -> Callable[[ExtensionHandler], ExtensionHandler]: ...
+
+    @overload
+    def on(self, event: str, handler: ExtensionHandler) -> ExtensionHandler: ...
 
     def on(
         self,
