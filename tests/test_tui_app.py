@@ -381,6 +381,8 @@ class FakeSession:
             return CommandResult(handled=True, compact_summary=text.removeprefix("/compact "))
         if text == "/export":
             return CommandResult(handled=True, export_requested=True)
+        if text == "/copy":
+            return CommandResult(handled=True, copy_requested=True, copy_text="The answer.")
         if text.startswith("/export "):
             return CommandResult(
                 handled=True,
@@ -4340,6 +4342,22 @@ async def test_tui_sidebar_command_toggles_visibility_without_changing_position(
         await pilot.pause()
         assert sidebar.display is True
         assert app.has_class("-sidebar-right") is (position == "right")
+
+
+@pytest.mark.anyio
+async def test_tui_copy_command_writes_through_the_apps_clipboard_chain() -> None:
+    """`/copy` uses the app's own clipboard path, which knows this terminal."""
+    app = TauTuiApp(FakeSession())
+    copied: list[str] = []
+    app.copy_to_clipboard = copied.append  # type: ignore[method-assign]
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/copy"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert copied == ["The answer."]
 
 
 @pytest.mark.anyio

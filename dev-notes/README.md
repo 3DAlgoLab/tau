@@ -44,6 +44,9 @@ User-facing documentation lives in `website/content/` and is published at
   live interpreter per session, why its interrupt ladder is SIGINT-then-kill
   instead of a Jupyter control channel, and why that interpreter is the project's
   own `.venv` rather than whatever Python Tau happens to run on.
+- `copy-last-response-command.md` — how `/copy` splits "what to copy" from "how to
+  reach this frontend's clipboard", and why the core helper never emits terminal
+  escape codes.
 - `tui-latency-fixes.md` — profiled causes of slow prompt echo and startup, and
   the stamp-validated caches and scheduling changes that fixed them.
 

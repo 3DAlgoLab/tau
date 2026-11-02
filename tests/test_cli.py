@@ -13,6 +13,7 @@ from tau_ai import (
 )
 from tau_coding import CodingSessionRecord, SessionManager, cli
 from tau_coding.cli import app, run_print_mode
+from tau_coding.clipboard import ClipboardOutcome
 from tau_coding.paths import TauPaths
 from tau_coding.provider_config import (
     OpenAICompatibleProviderConfig,
@@ -829,6 +830,56 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     assert captured.err == ""
     assert provider.calls == []
     assert await storage.read_all() == []
+
+
+@pytest.mark.anyio
+async def test_run_print_mode_copy_command_uses_the_clipboard_helper(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Print mode has no Textual clipboard chain, so it writes through the helper."""
+    storage = JsonlSessionStorage(tmp_path / "copy-session.jsonl")
+    resources = TauResourcePaths(root=tmp_path / "resources", agents_root=None)
+    answered = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="The answer.")),
+            ]
+        ]
+    )
+    assert await run_print_mode(
+        prompt="Hello",
+        model="fake",
+        cwd=tmp_path,
+        provider=answered,
+        storage=storage,
+        resource_paths=resources,
+    )
+    capsys.readouterr()
+
+    copied: list[str] = []
+
+    def fake_copy(text: str) -> ClipboardOutcome:
+        copied.append(text)
+        return ClipboardOutcome(ok=True, backend="wl-copy")
+
+    monkeypatch.setattr(cli, "copy_to_clipboard", fake_copy)
+
+    ok = await run_print_mode(
+        prompt="/copy",
+        model="fake",
+        cwd=tmp_path,
+        provider=FakeProvider([]),
+        storage=storage,
+        resource_paths=resources,
+    )
+
+    captured = capsys.readouterr()
+    assert ok is True
+    assert copied == ["The answer."]
+    assert captured.out == "Copied 11 characters to the clipboard (wl-copy).\n"
 
 
 @pytest.mark.anyio

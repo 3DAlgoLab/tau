@@ -5174,6 +5174,12 @@ class TauTuiApp(App[None]):
                     )
                 except Exception as exc:  # noqa: BLE001 - surface command failures in the TUI
                     self._notify(f"Could not export session: {exc}", severity="error")
+            if command.copy_requested:
+                # The app, not the command, owns the clipboard here: Textual knows
+                # this terminal's protocol (OSC 52 over SSH) and its native path.
+                copied = command.copy_text or ""
+                self.copy_to_clipboard(copied)
+                self._notify(f"Copied {len(copied):,} characters to the clipboard.")
             if command.resume_session_id is not None:
                 await self._resume_session(command.resume_session_id)
             if command.resume_picker_requested:

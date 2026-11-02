@@ -7311,3 +7311,40 @@ async def test_dynamic_provider_rejects_unsupported_thinking_override(
         )
 
 
+@pytest.mark.anyio
+async def test_last_assistant_text_names_the_answer_to_copy(tmp_path: Path) -> None:
+    """Copy-style commands want the newest prose, not the newest transcript entry."""
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer.")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="   \n")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer.")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        _config(tmp_path, provider, JsonlSessionStorage(tmp_path / "copy.jsonl"))
+    )
+
+    assert session.last_assistant_text is None
+
+    await _collect_session_events(session.prompt("one"))
+
+    assert session.last_assistant_text == "First answer."
+
+    await _collect_session_events(session.prompt("two"))
+
+    # A turn that produced no prose leaves the previous answer as the copyable one.
+    assert session.last_assistant_text == "First answer."
+
+    await _collect_session_events(session.prompt("three"))
+
+    assert session.last_assistant_text == "Second answer."

@@ -22,6 +22,7 @@ from tau_ai.env import (
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
 )
 from tau_coding.catalog_loader import user_catalog_path
+from tau_coding.clipboard import copy_to_clipboard, format_clipboard_result
 from tau_coding.commands import format_reload_summary
 from tau_coding.credentials import FileCredentialStore
 from tau_coding.extension_installer import ExtensionInstallError, install_extension
@@ -1373,6 +1374,10 @@ async def run_print_mode(
                 )
             if command.sidebar_toggle_requested:
                 message = "The /sidebar command is interactive-only."
+            if command.copy_requested:
+                copied = command.copy_text or ""
+                outcome = copy_to_clipboard(copied)
+                message = format_clipboard_result(outcome, characters=len(copied))
             if command.reload_requested:
                 try:
                     summary = await session.reload()

@@ -93,6 +93,9 @@ class CommandSession(Protocol):
     def session_title(self) -> str | None: ...
 
     @property
+    def last_assistant_text(self) -> str | None: ...
+
+    @property
     def session_manager(self) -> SessionManager | None: ...
 
     def ensure_session_indexed(self) -> None: ...
@@ -113,6 +116,8 @@ class CommandResult:
     export_requested: bool = False
     export_destination: Path | None = None
     export_format: str | None = None
+    copy_requested: bool = False
+    copy_text: str | None = None
     resume_session_id: str | None = None
     resume_picker_requested: bool = False
     prompts_picker_requested: bool = False
@@ -255,6 +260,15 @@ def create_default_command_registry() -> CommandRegistry:
             usage="/export [--format html|jsonl] [destination]",
             description="Export the current session.",
             handler=_export_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="copy",
+            usage="/copy",
+            description="Copy the last assistant response to the clipboard.",
+            handler=_copy_command,
+            search_terms=("paste", "answer"),
         )
     )
     registry.register(
@@ -451,6 +465,24 @@ def _export_command(context: CommandContext) -> CommandResult:
         export_destination=destination,
         export_format=export_format,
     )
+
+
+def _copy_command(context: CommandContext) -> CommandResult:
+    """Ask the frontend to put the last response on the clipboard.
+
+    The copy itself belongs to the frontend: the TUI knows its terminal's
+    clipboard protocol, and print mode reaches the system through a tool. This
+    handler decides only *what* is copied, so both paths copy the same answer.
+    """
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /copy")
+    text = context.session.last_assistant_text
+    if text is None:
+        return CommandResult(
+            handled=True,
+            message="Nothing to copy yet — this session has no assistant response.",
+        )
+    return CommandResult(handled=True, copy_requested=True, copy_text=text)
 
 
 def _status_command(context: CommandContext) -> CommandResult:

@@ -985,6 +985,22 @@ class CodingSession:
         return self._harness.messages
 
     @property
+    def last_assistant_text(self) -> str | None:
+        """Return the most recent assistant prose, skipping tool-only turns.
+
+        Copy-style commands use this. A turn that ended in tool calls carries no
+        prose of its own, so there is nothing to copy and this stays ``None``
+        rather than returning an empty string a frontend would have to re-check.
+        """
+        for message in reversed(self.messages):
+            if getattr(message, "role", None) != "assistant":
+                continue
+            text = message_text(message).strip()
+            if text:
+                return text
+        return None
+
+    @property
     def state(self) -> SessionState:
         """Return the last replayed durable session state."""
         return self._state

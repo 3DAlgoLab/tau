@@ -14,6 +14,7 @@ command palette with **Ctrl+K**.
 | `/system` | Show the active system prompt grouped by source without adding it to context or session history |
 | `/compact [instructions]` | Summarize and compact the active context |
 | `/export [--format html\|jsonl] [dest]` | Export the current session |
+| `/copy` | Copy the last assistant response to the clipboard |
 | `/resume [session-id]` | Resume a previous session, or open the picker |
 | `/tree` | Branch from an earlier point in the session tree |
 | `/name <new name>` | Rename the current session and, in supported terminals, the terminal tab title |
@@ -30,6 +31,14 @@ command palette with **Ctrl+K**.
 | `/hotkeys` | Show the keyboard shortcuts |
 | `/skills` | Open a searchable picker of loaded skills and insert a selection into the prompt |
 | `/skill:<name> [request]` | Expand a loaded skill into your prompt |
+
+> [!NOTE] `/copy` copies the newest assistant prose
+> `/copy` takes the most recent assistant text, skipping turns that ended in tool
+> calls with no prose of their own. In the TUI the write goes through Textual, so
+> terminals that speak OSC 52 — including SSH sessions — receive it. In print mode
+> (`tau --resume <id> --print "/copy"`) Tau uses a clipboard tool instead
+> (`wl-copy`, `pbcopy`, `xclip`, `xsel`, `clip`), and if none is installed it says
+> so rather than failing.
 
 `/system` labels contiguous prompt sections with their origin, including Tau's
 built-in prompt, `SYSTEM.md` and `APPEND_SYSTEM.md` files, project instruction

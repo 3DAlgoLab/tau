@@ -48,6 +48,7 @@ class FakeSession:
         self.system_prompt = "You are Tau.\nFollow project instructions."
         self.session_id = "session-1"
         self.session_title: str | None = None
+        self.last_assistant_text: str | None = None
         self.session_manager: SessionManager | None = manager
         self.ensure_session_indexed_called = False
         self.reload_called = False
@@ -126,6 +127,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
 
     assert [command.name for command in commands] == [
         "compact",
+        "copy",
         "export",
         "hotkeys",
         "local",
@@ -255,6 +257,35 @@ def test_export_command_parses_format_and_destination(tmp_path: Path) -> None:
     assert result.export_requested is True
     assert result.export_format == "jsonl"
     assert result.export_destination == Path("exports/session.jsonl")
+
+
+def test_copy_command_requests_a_frontend_copy(tmp_path: Path) -> None:
+    session = FakeSession(tmp_path)
+    session.last_assistant_text = "The answer is 42."
+
+    result = create_default_command_registry().execute(session, "/copy")
+
+    assert result.handled is True
+    assert result.copy_requested is True
+    assert result.copy_text == "The answer is 42."
+    assert result.message is None
+
+
+def test_copy_command_says_when_there_is_nothing_to_copy(tmp_path: Path) -> None:
+    session = FakeSession(tmp_path)
+    session.last_assistant_text = None
+
+    result = create_default_command_registry().execute(session, "/copy")
+
+    assert result.copy_requested is False
+    assert "Nothing to copy" in (result.message or "")
+
+
+def test_copy_command_rejects_arguments(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/copy last reply")
+
+    assert result.copy_requested is False
+    assert result.message == "Usage: /copy"
 
 
 def test_session_command_includes_session_details(tmp_path: Path) -> None:
