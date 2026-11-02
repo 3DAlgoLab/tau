@@ -26,11 +26,18 @@ Porting Pi's some essential features to Tau
 
 - [ ] Stall Guard follow-up (optional fidelity): add a `session_start` handler that clears the session  budget, matching Pi's reset on `session_start`/`session_tree`. Currently only `agent_start` (per-run)  and `/stall-guard reset` (session) clear counters.
 
-- [ ] Stall Guard drift — **the installed copy is ahead of the repo** (found 2026-11-03):
-  `~/.tau/extensions/stall_guard.py` has 30 lines that `examples/extensions/stall_guard.py` does not
-  (+30/−2), including the up-front exclusion `if message.stop_reason in {"error", "aborted", "length"}` and the
-  doc paragraph explaining why a `length` stop is never retried. Port that back into `examples/` and
-  cover it with a test, or the behaviour lives only in one machine's install.
+- [x] Stall Guard drift — **closed 2026-11-03** (`c6bdfdf`): the installed copy had been ahead
+  of the repo (+30/−2: the up-front `stop_reason in {"error", "aborted", "length"}` exclusion and
+  the doc paragraph explaining why a `length` stop is never retried). Ported into
+  `examples/extensions/stall_guard.py` and covered by two new tests; the core-side half is
+  `2e31f09`.
+
+- [ ] Installed runtime lags the repo — the live `tau` (uv tool env, `tau-ai 0.4.9b2`) still has
+  no `_compact_context_before_request` and no truncation recovery, which is exactly why the
+  2026-11-03 stall happened while the repo already contained half the fix. Either install the
+  checkout into the tool env (`uv tool install --editable .`) or cut the next beta and reinstall;
+  after either, re-verify with
+  `grep -c "_compact_context_before_request" ~/.local/share/uv/tools/tau-ai/lib/python3.13/site-packages/tau_coding/session.py`.
 
 - [ ] Heartbeat / `schedule_prompt` port — **installable and verified loading as of
   2026-11-02, still NOT official** (out-of-tree at `../tau-schedule-prompt`); see
@@ -60,7 +67,7 @@ Pi's features:
 ## Stall Guard (done)
 
 - Extension: `examples/extensions/stall_guard.py`
-- Tests: `tests/test_stall_guard_extension.py` (18: 10 end-to-end `CodingSession` + `FakeProvider`, 8 runtime-level)
+- Tests: `tests/test_stall_guard_extension.py` (20: 11 end-to-end `CodingSession` + `FakeProvider`, 9 runtime-level)
 - Docs: `website/content/guides/extensions.md` (example list + inline-dispatch note; also fixed the stale
   `context.api.notify(...)` example -> `tau.notify(...)`), `dev-notes/stall-guard-extension.md`
 - Installed: `tau install ./examples/extensions/stall_guard.py` -> `~/.tau/extensions/stall_guard.py` (copied, not symlinked)
@@ -91,11 +98,28 @@ Pi's features:
 - Installed-load probe against packaged `tau` 0.4.8: extension `stall_guard` (source `user`),
   4 handlers, command `stall-guard`, renderer `stall-guard:retry`, no error diagnostics.
 
-### Drift (2026-11-03)
+### Drift (2026-11-03) — closed
 
-`diff` of `examples/extensions/stall_guard.py` against `~/.tau/extensions/stall_guard.py`: **+30 lines
-installed-only** (the `stop_reason in {"error", "aborted", "length"}` exclusion and its rationale).
-The repo is behind the live extension — see the TODO item above.
+`diff` of `examples/extensions/stall_guard.py` against `~/.tau/extensions/stall_guard.py` was
+**+30 lines installed-only** (the `stop_reason in {"error", "aborted", "length"}` exclusion and its
+rationale). Closed by `c6bdfdf`, which ported the live behaviour into `examples/` and added
+`test_length_stop_is_never_rescued` and
+`test_truncated_turn_warns_and_leaves_the_continue_to_core`. Both fail against the pre-port
+source, verified by checking out `HEAD~1` of the file and re-running the suite (2 failed,
+18 passed). Byte equality after reinstalling is re-checked below.
+
+### Core-side counterpart: a truncated turn that showed nothing (2026-11-03, `2e31f09`)
+
+The guard is right not to retry, but on its own that leaves the run silent. Live sequence: entry
+308 `stop_reason="length"` at 131,064/131,072 tokens with only a thinking block, entry 309
+automatic compaction at 03:43, entry 310 the user typing `continue` at 03:50. The provider
+truncated instead of rejecting, so the overflow path never saw it; compaction ran *after* the run
+had settled, and nothing resumes a settled run.
+
+`CodingSession` now recognises that shape (`stop_reason == "length"`, no tool call, no text) and
+compacts-then-continues once (`MAX_TRUNCATION_RECOVERIES = 1`), reusing the overflow path's
+events. The guard keeps the notification. Write-up: `dev-notes/context-overflow-recovery.md`
+("Second phase") and `website/content/guides/context.md`.
 
 ## Persistent Python kernel (done)
 
