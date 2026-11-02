@@ -664,7 +664,7 @@ from tau_coding.extensions import TurnEndEvent, TurnStartEvent
 def setup(tau):
     @tau.on("turn_start")
     def on_turn_start(event: TurnStartEvent, context):
-        context.api.notify(
+        tau.notify(
             f"turn {event.turn_index} started at {event.timestamp}", "info"
         )
 
@@ -675,7 +675,16 @@ def setup(tau):
 
 These enriched payloads are defined in `tau_coding.extensions`. The portable
 `tau_agent.events.TurnStartEvent` and `TurnEndEvent` intentionally omit session
-metadata, so reusable agent code stays independent of session policy.
+metadata, so reusable agent code stays independent of session policy. Event
+handlers receive an `ExtensionContext` (read-only state plus `context.ui`); use
+the `tau` object captured in `setup` for actions such as `tau.notify(...)`.
+
+Agent events are dispatched inline from the harness listener, before the agent
+loop advances. A handler that queues steering or follow-up input during a run
+(`send_user_message`, `send_custom_message`) is therefore drained by that same
+run: queueing from the `turn_end` of a turn whose assistant message requested no
+tool call is how an extension forces one more model request instead of letting
+the run settle. `examples/extensions/stall_guard.py` uses exactly that.
 
 Lifecycle and intercepting hooks:
 
@@ -819,6 +828,11 @@ See [`examples/extensions/`](https://github.com/huggingface/tau/tree/main/exampl
 - **`hello_tool.py`** — minimal custom tool.
 - **`permission_gate.py`** — blocks dangerous bash commands with the
   `tool_call` hook.
+- **`stall_guard.py`** — rescues a turn that ended with no tool call (leaked
+  tool-call markup in prose, a `toolUse` stop reason with no call block, or a
+  thinking-only message) by queuing one corrective follow-up so the same run
+  retries, bounded per run and per session; `/stall-guard` shows or resets the
+  budget.
 - **`sidebar_status.py`** — adds and updates a host-framed sidebar section.
 - **`prompt_section.py`** — appends a labeled multi-line system-prompt section.
 

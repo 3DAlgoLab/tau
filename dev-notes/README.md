@@ -34,6 +34,9 @@ User-facing documentation lives in `website/content/` and is published at
   failure handling, and Phase 5 validation.
 - `architecture/phase-6-local-inference-hardening.md` — second-backend contract
   validation, lifecycle hardening, migration, and security decisions.
+- `stall-guard-extension.md` — how the shipped `stall_guard` example rescues a
+  turn that ended with no tool call, and why inline agent-event dispatch makes a
+  queued follow-up continue the same run.
 - `tui-latency-fixes.md` — profiled causes of slow prompt echo and startup, and
   the stamp-validated caches and scheduling changes that fixed them.
 

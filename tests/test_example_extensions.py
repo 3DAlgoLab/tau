@@ -93,6 +93,7 @@ def test_shipped_examples_load(tmp_path: Path) -> None:
         "permission_gate.py",
         "prompt_section.py",
         "sidebar_status.py",
+        "stall_guard.py",
     )
 
     assert runtime.extension_names == (
@@ -101,6 +102,7 @@ def test_shipped_examples_load(tmp_path: Path) -> None:
         "permission_gate",
         "prompt_section",
         "sidebar_status",
+        "stall_guard",
     )
     assert [tool.name for tool in runtime.extension_tools] == [
         "ask_user_question",
