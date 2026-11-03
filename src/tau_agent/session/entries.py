@@ -83,6 +83,12 @@ class CompactionEntry(BaseSessionEntry):
     provider: str | None = None
     model: str | None = None
     response_provider: str | None = None
+    # Structured metadata from whichever component produced the summary. Tau's
+    # own summarizer leaves this empty; an extension that replaces the
+    # compaction summary through the `session_before_compact` hook stores its
+    # canonical records here so later compactions can re-render them. Replay
+    # never reads it: context is still rebuilt from `summary`.
+    details: JSONValue = None
 
 
 class BranchSummaryEntry(BaseSessionEntry):

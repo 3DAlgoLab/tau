@@ -76,11 +76,15 @@ from tau_coding.events import (
     AutoRetryStartEvent,
     CodingSessionEvent,
     CompactionEndEvent,
+    CompactionReason,
     CompactionStartEvent,
     QueueUpdateEvent,
     SessionAgentEndEvent,
     SessionInfoChangedEvent,
     ThinkingLevelChangedEvent,
+)
+from tau_coding.extensions.api import (
+    SessionBeforeCompactEvent,
 )
 from tau_coding.extensions.provider_registry import DynamicProviderRegistry
 from tau_coding.extensions.providers import DynamicProvider, ProviderModel
@@ -326,6 +330,7 @@ class CompactionPlan:
     first_kept_entry_id: str
     replaced_entry_count: int
     messages_to_summarize: tuple[AgentMessage, ...]
+    replaced_entry_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +342,7 @@ class _GeneratedSummary:
     provider: str | None = None
     model: str | None = None
     response_provider: str | None = None
+    details: dict[str, JSONValue] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,6 +1015,16 @@ class CodingSession:
     def messages(self) -> tuple[AgentMessage, ...]:
         """Return the restored/current transcript."""
         return self._harness.messages
+
+    @property
+    def entries(self) -> tuple[SessionEntry, ...]:
+        """Return the active branch's append-only entries (pre-compaction).
+
+        `messages` is the projected active context; this is the lossless record
+        behind it, which extensions read for recovery and for building their own
+        compaction checkpoints.
+        """
+        return self._state.entries
 
     @property
     def last_assistant_text(self) -> str | None:
@@ -3189,10 +3205,13 @@ class CodingSession:
         if plan is None:
             raise ValueError("Not enough context to compact while preserving recent entries")
         tokens_before = self.context_token_estimate
-        generated = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
+        generated = await self._compaction_summary_for_plan(
+            plan,
+            reason="manual",
             custom_instructions=instructions,
         )
+        if generated is None:
+            raise ValueError("Compaction cancelled by an extension")
         await self._append_compaction(
             generated.text,
             first_kept_entry_id=plan.first_kept_entry_id,
@@ -3201,6 +3220,7 @@ class CodingSession:
             provider=generated.provider,
             model=generated.model,
             response_provider=generated.response_provider,
+            details=generated.details,
         )
         return ManualCompactionResult(
             summary=generated.text,
@@ -4021,7 +4041,9 @@ class CodingSession:
             if plan is None:
                 return False
             tokens_before = self.context_token_estimate
-            generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+            generated = await self._compaction_summary_for_plan(plan, reason="overflow")
+            if generated is None:
+                return False
             await self._append_compaction(
                 generated.text,
                 first_kept_entry_id=plan.first_kept_entry_id,
@@ -4030,6 +4052,7 @@ class CodingSession:
                 provider=generated.provider,
                 model=generated.model,
                 response_provider=generated.response_provider,
+                details=generated.details,
             )
             return True
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
@@ -4223,7 +4246,9 @@ class CodingSession:
         if plan is None:
             return False
         tokens_before = self.context_token_estimate
-        generated = await self._generate_compaction_summary(plan.messages_to_summarize)
+        generated = await self._compaction_summary_for_plan(plan, reason="threshold")
+        if generated is None:
+            return False
         await self._append_compaction(
             generated.text,
             first_kept_entry_id=plan.first_kept_entry_id,
@@ -4232,6 +4257,7 @@ class CodingSession:
             provider=generated.provider,
             model=generated.model,
             response_provider=generated.response_provider,
+            details=generated.details,
         )
         return True
 
@@ -4276,6 +4302,52 @@ class CodingSession:
             provider=self.provider_name,
             model=self.model,
             response_provider=response_provider,
+        )
+
+    async def _compaction_summary_for_plan(
+        self,
+        plan: CompactionPlan,
+        *,
+        reason: CompactionReason,
+        custom_instructions: str | None = None,
+    ) -> _GeneratedSummary | None:
+        """Summarize a compaction plan, letting extensions replace the summary.
+
+        Every compaction path (manual `/compact`, threshold, overflow, and
+        truncation recovery) routes through here, so a `session_before_compact`
+        handler cannot be bypassed by the trigger that fired. Tau owns the
+        boundary and the token accounting; the hook owns the summary text and
+        its canonical metadata. Returns `None` when a handler cancels, which
+        leaves the active context and the session file untouched.
+        """
+        if self._extension_runtime.has_session_before_compact_handlers:
+            decision = await self._extension_runtime.run_session_before_compact(
+                SessionBeforeCompactEvent(
+                    reason=reason,
+                    first_kept_entry_id=plan.first_kept_entry_id,
+                    replaced_entry_ids=plan.replaced_entry_ids,
+                    messages_to_summarize=plan.messages_to_summarize,
+                    tokens_before=self.context_token_estimate,
+                    context_window_tokens=self.context_window_tokens,
+                    custom_instructions=custom_instructions,
+                )
+            )
+            if decision is not None:
+                if decision.cancel:
+                    return None
+                summary = (decision.summary or "").strip()
+                if summary:
+                    return _GeneratedSummary(
+                        text=summary,
+                        usage=None,
+                        provider=None,
+                        model=None,
+                        response_provider=None,
+                        details=decision.details,
+                    )
+        return await self._generate_compaction_summary(
+            plan.messages_to_summarize,
+            custom_instructions=custom_instructions,
         )
 
     async def _summarize_branch_messages(
@@ -4329,6 +4401,7 @@ class CodingSession:
             first_kept_entry_id=rows[first_kept_index][0],
             replaced_entry_count=len(replaced),
             messages_to_summarize=tuple(message for _entry_id, message in replaced),
+            replaced_entry_ids=tuple(entry_id for entry_id, _message in replaced),
         )
 
     def _active_context_rows(self) -> tuple[tuple[str, AgentMessage], ...]:
@@ -4344,6 +4417,7 @@ class CodingSession:
         provider: str | None = None,
         model: str | None = None,
         response_provider: str | None = None,
+        details: dict[str, JSONValue] | None = None,
     ) -> CompactionEntry:
         if first_kept_entry_id not in self._state.context_entry_ids:
             raise ValueError("First kept entry is not in the active context")
@@ -4357,6 +4431,7 @@ class CodingSession:
             provider=provider,
             model=model,
             response_provider=response_provider,
+            details=details,
         )
         await self._append_session_entry(compaction)
         self._last_parent_id = compaction.id

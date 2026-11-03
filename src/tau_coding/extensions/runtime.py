@@ -18,6 +18,7 @@ from tau_agent.events import AgentEvent, AgentStartEvent
 from tau_agent.events import TurnEndEvent as AgentTurnEndEvent
 from tau_agent.events import TurnStartEvent as AgentTurnStartEvent
 from tau_agent.messages import AgentMessage, TextContent
+from tau_agent.session.entries import SessionEntry
 from tau_agent.tools import (
     AgentTool,
     AgentToolResult,
@@ -52,6 +53,8 @@ from tau_coding.extensions.api import (
     MessageRenderOptions,
     NullUiBridge,
     RegisteredExtension,
+    SessionBeforeCompactEvent,
+    SessionBeforeCompactResult,
     SessionLifecycleReason,
     SessionShutdownEvent,
     SessionStartEvent,
@@ -146,6 +149,12 @@ class BoundSession(Protocol):
 
     @property
     def messages(self) -> tuple[AgentMessage, ...]: ...
+
+    @property
+    def entries(self) -> tuple[SessionEntry, ...]: ...
+
+    @property
+    def context_window_tokens(self) -> int: ...
 
     def queue_steering_message(
         self,
@@ -1237,6 +1246,46 @@ class ExtensionRuntime:
             if result.action == "transform" and result.text is not None:
                 current = result.text
         return InputHookOutcome(handled=False, text=current)
+
+    @property
+    def has_session_before_compact_handlers(self) -> bool:
+        """Return whether any loaded extension wants the pre-compaction hook.
+
+        Callers use this to skip building the hook payload entirely: sessions
+        without such an extension keep the exact pre-hook compaction path.
+        """
+        return next(self._handlers_for("session_before_compact"), None) is not None
+
+    async def run_session_before_compact(
+        self, event: SessionBeforeCompactEvent
+    ) -> SessionBeforeCompactResult | None:
+        """Run `session_before_compact` handlers and return the first decision.
+
+        Ports Pi's pre-compaction hook: a handler may supply the summary text
+        and canonical `details` for the boundary Tau already chose, or cancel
+        the compaction. The first decisive handler wins and the remaining ones
+        are skipped, because two different checkpoint formats in one compaction
+        would be meaningless.
+
+        A crashing handler is recorded and skipped rather than deciding the
+        outcome: unlike `tool_call`, refusing to compact can strand a session
+        that is already over the context window, so Tau falls through to its own
+        summarizer.
+        """
+        for owner, handler in self._handlers_for("session_before_compact"):
+            try:
+                result = await _resolve(handler(event, self._fresh_context(owner.source_id)))
+            except Exception as exc:  # noqa: BLE001 - never block a compaction on a handler crash
+                self._record_runtime_failure(owner.name, "session_before_compact", exc)
+                continue
+            if result is None:
+                continue
+            if not isinstance(result, SessionBeforeCompactResult):
+                self._record_bad_result(owner.name, "session_before_compact", result)
+                continue
+            if result.cancel or (result.summary or "").strip():
+                return result
+        return None
 
     async def emit_event(self, event: object) -> None:
         """Dispatch one canonical agent or coding-session event to extensions."""

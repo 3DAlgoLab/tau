@@ -12,11 +12,13 @@ from uuid import uuid4
 from tau_agent.messages import AgentMessage, ToolResultMessage
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_agent.types import JSONValue
+from tau_coding.events import CompactionReason
 
 if TYPE_CHECKING:
     from textual import events
     from textual.widget import Widget
 
+    from tau_agent.session.entries import SessionEntry
     from tau_coding.extensions.providers import DynamicProvider
     from tau_coding.extensions.runtime import ExtensionRuntime
     from tau_coding.local_backends import LocalBackend
@@ -57,6 +59,7 @@ LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset(
         "input",
         "tool_call",
         "tool_result",
+        "session_before_compact",
         "project_trust",
     }
 )
@@ -502,6 +505,46 @@ class ToolResultHookResult:
     """Result of a `tool_result` hook handler; set fields to override."""
 
     content: str | None = None
+    details: dict[str, JSONValue] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionBeforeCompactEvent:
+    """Payload for the `session_before_compact` hook, before any summary exists.
+
+    Ports Pi's `session_before_compact` preparation payload. Tau has already
+    chosen the boundary (`first_kept_entry_id` and the replaced active-context
+    entries); a handler supplies the summary text for that boundary, not a new
+    one. `messages_to_summarize` are the projected messages of the replaced
+    entries, so an earlier compaction's summary appears here as the carried
+    base. `entries` on `context` remains the lossless branch: compaction has
+    not removed anything from storage at hook time.
+    """
+
+    reason: CompactionReason
+    first_kept_entry_id: str
+    replaced_entry_ids: tuple[str, ...]
+    messages_to_summarize: tuple[AgentMessage, ...]
+    tokens_before: int
+    context_window_tokens: int
+    custom_instructions: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionBeforeCompactResult:
+    """Result of a `session_before_compact` hook handler.
+
+    `summary` replaces the model-generated compaction summary for this run and
+    wins over later handlers; `details` is persisted on the resulting
+    `CompactionEntry` so a later compaction can re-render from canonical data
+    instead of from the previously rendered summary. `cancel=True` skips the
+    compaction entirely (the boundary stays where it is, nothing is written).
+    Returning `None`, or an empty `summary`, leaves Tau's model summarizer in
+    charge.
+    """
+
+    cancel: bool = False
+    summary: str | None = None
     details: dict[str, JSONValue] | None = None
 
 
@@ -1000,16 +1043,38 @@ class ExtensionContext:
     def transcript(self) -> tuple[AgentMessage, ...]:
         """Return the active-path parent conversation as read-only copies.
 
-        Mirrors the read access Pi extensions get via
-        ``ctx.sessionManager.getBranch()``: the user/assistant/tool messages on
-        the current branch, with compaction and branch summaries already folded
+        This is the **projected** context: the user/assistant/tool messages on
+        the current branch with compaction and branch summaries already folded
         in as ``UserMessage`` entries (Tau has no separate summary message
-        type). Each message is deep-copied so an extension mutating a returned
-        object cannot corrupt the live session transcript.
+        type). It is not the lossless branch — read :attr:`entries` for that.
+        Each message is deep-copied so an extension mutating a returned object
+        cannot corrupt the live session transcript.
         """
         self._generation.assert_active()
         messages = self._runtime.session_view.messages
         return tuple(message.model_copy(deep=True) for message in messages)
+
+    @property
+    def entries(self) -> tuple[SessionEntry, ...]:
+        """Return the raw append-only entries of the active branch.
+
+        Unlike :attr:`transcript`, this is the lossless record: every message
+        entry is present even after compaction folded it out of the model
+        context, and `CompactionEntry`/`CustomEntry` records are included. An
+        extension that replaces compaction (or recovers older output for the
+        model) reads Store A here; the projected transcript is only what the
+        provider currently sees.
+
+        Entries are deep-copied so a handler cannot mutate live session state.
+        """
+        self._generation.assert_active()
+        return tuple(entry.model_copy(deep=True) for entry in self._runtime.session_view.entries)
+
+    @property
+    def context_window_tokens(self) -> int:
+        """Return the effective context window for the active model."""
+        self._generation.assert_active()
+        return self._runtime.session_view.context_window_tokens
 
     @property
     def has_ui(self) -> bool:

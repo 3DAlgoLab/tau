@@ -18,6 +18,7 @@ from tau_agent.session import (
     JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
+    SessionEntry,
 )
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_agent.types import JSONValue
@@ -46,6 +47,8 @@ from tau_coding.extensions import (
     ProviderModelSnapshot,
     ProviderRefreshContext,
     RefreshModels,
+    SessionBeforeCompactEvent,
+    SessionBeforeCompactResult,
     ToolCallHookResult,
     ToolResultHookResult,
     discover_extensions,
@@ -141,6 +144,8 @@ class RecordingSession:
         )
         self.is_running = running
         self.messages: tuple[AgentMessage, ...] = ()
+        self.entries: tuple[SessionEntry, ...] = ()
+        self.context_window_tokens = 128_000
         self.steered: list[str] = []
         self.followed_up: list[str] = []
         self.custom_entries: list[tuple[str, dict[str, JSONValue]]] = []
@@ -1255,6 +1260,95 @@ async def test_raising_tool_result_hook_keeps_result(tmp_path: Path) -> None:
     assert any("tool_result" in diag.message for diag in runtime.diagnostics)
 
 
+def _compaction_request(*, reason: str = "manual") -> SessionBeforeCompactEvent:
+    return SessionBeforeCompactEvent(
+        reason=reason,  # type: ignore[arg-type]
+        first_kept_entry_id="keep-me",
+        replaced_entry_ids=("old-user", "old-answer"),
+        messages_to_summarize=(UserMessage(content="Earlier work."),),
+        tokens_before=40_000,
+        context_window_tokens=60_000,
+        custom_instructions=None,
+    )
+
+
+async def test_session_before_compact_hook_overrides_summary(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "checkpointer")
+    api.on(
+        "session_before_compact",
+        lambda event, context: SessionBeforeCompactResult(
+            summary="Checkpoint verbatim text",
+            details={"kind": "mech-compact", "span": {"lines": ["[User]: Earlier work."]}},
+        ),
+    )
+    # A second handler must not get a vote once one has decided.
+    api.on(
+        "session_before_compact",
+        lambda event, context: SessionBeforeCompactResult(summary="ignored later handler"),
+    )
+
+    assert runtime.has_session_before_compact_handlers is True
+    result = await runtime.run_session_before_compact(_compaction_request())
+
+    assert result is not None
+    assert result.summary == "Checkpoint verbatim text"
+    assert result.details == {
+        "kind": "mech-compact",
+        "span": {"lines": ["[User]: Earlier work."]},
+    }
+    assert runtime.diagnostics == ()
+
+
+async def test_session_before_compact_hook_cancel_short_circuits(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "canceler")
+    api.on("session_before_compact", lambda event, context: SessionBeforeCompactResult(cancel=True))
+    api.on(
+        "session_before_compact",
+        lambda event, context: SessionBeforeCompactResult(summary="must not run"),
+    )
+
+    result = await runtime.run_session_before_compact(_compaction_request())
+
+    assert result is not None
+    assert result.cancel is True
+    assert result.summary is None
+
+
+async def test_raising_session_before_compact_hook_falls_through(tmp_path: Path) -> None:
+    """A crashing handler must never strand a session that needs to compact."""
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "raiser")
+
+    def bad_hook(event: object, context: object) -> None:
+        raise RuntimeError("checkpoint exploded")
+
+    api.on("session_before_compact", bad_hook)
+
+    result = await runtime.run_session_before_compact(_compaction_request())
+
+    assert result is None
+    assert any("session_before_compact" in diag.message for diag in runtime.diagnostics)
+
+
+async def test_non_result_session_before_compact_hook_is_a_diagnostic(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "wrong-shape")
+    api.on("session_before_compact", lambda event, context: {"summary": "not a result"})
+
+    result = await runtime.run_session_before_compact(_compaction_request())
+
+    assert result is None
+    assert any("session_before_compact" in diag.message for diag in runtime.diagnostics)
+
+
+def test_runtime_without_hook_handlers_reports_no_override(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+
+    assert runtime.has_session_before_compact_handlers is False
+
+
 async def test_input_hooks_chain_transforms(tmp_path: Path) -> None:
     runtime = ExtensionRuntime()
     api = _register_inline_extension(runtime, "chain")
@@ -1631,6 +1725,39 @@ def test_transcript_returns_copies_so_mutation_cannot_corrupt_session(tmp_path: 
     transcript[0].content = "tampered"
 
     assert session.messages[0].content == "original"
+
+
+def test_entries_expose_the_raw_branch_and_cannot_be_tampered(tmp_path: Path) -> None:
+    """`context.entries` is the lossless record behind `context.transcript`."""
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "reader")
+    session = RecordingSession(tmp_path)
+    session.messages = (UserMessage(content="summary only"),)
+    session.entries = (
+        MessageEntry(message=UserMessage(content="raw prompt")),
+        MessageEntry(message=AssistantMessage(content="raw answer")),
+        CustomEntry(namespace="transparent-compact:method", data={"method": "verbatim"}),
+    )
+    runtime.bind(session)
+
+    entries = api.context.entries  # type: ignore[attr-defined]
+
+    assert [entry.type for entry in entries] == ["message", "message", "custom"]
+    assert entries[0].message.content == "raw prompt"
+    assert entries[2].data == {"method": "verbatim"}
+
+    entries[0].message.content = "tampered"  # type: ignore[attr-defined]
+    assert session.entries[0].message.content == "raw prompt"  # type: ignore[attr-defined]
+
+
+def test_context_reports_the_effective_context_window(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "reader")
+    session = RecordingSession(tmp_path)
+    session.context_window_tokens = 60_000
+    runtime.bind(session)
+
+    assert api.context.context_window_tokens == 60_000  # type: ignore[attr-defined]
 
 
 # -- UI dialogs ---------------------------------------------------------------
