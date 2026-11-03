@@ -128,6 +128,35 @@ exist for that:
   this because extension tools are always appended afterwards. Unknown names
   are ignored; `None` disables filtering.
 
+## Overriding compaction (`session_before_compact`)
+
+An extension can replace Tau's model-generated compaction summary with its own
+text and run no summarization request at all. The hook fires for `manual`,
+`threshold`, and `overflow` compaction after Tau has chosen the boundary and
+before any summarizer runs:
+
+- `SessionBeforeCompactEvent` carries `reason`, `first_kept_entry_id`,
+  `replaced_entry_ids`, `messages_to_summarize` (projected rows; an earlier
+  checkpoint's rendered summary arrives here as the carried base),
+  `tokens_before`, `context_window_tokens`, and `custom_instructions`.
+- Return `SessionBeforeCompactResult(summary=..., details=...)` to own the
+  summary. `details` is persisted verbatim on the resulting `CompactionEntry`
+  (replay ignores it) so a later compaction can re-render from canonical data
+  after a reload, resume, or fork instead of re-summarizing rendered text.
+- Return `SessionBeforeCompactResult(cancel=True)` to skip that compaction.
+  Manual `/compact` reports the cancellation; automatic paths leave the context
+  untouched.
+- The first decisive handler wins. A handler that raises is recorded as a
+  diagnostic and Tau falls back to its own summarizer: unlike `tool_call`, a
+  broken handler must never prevent a compaction, because refusing to compact
+  can strand a session that is already over its window.
+
+`context.transcript` is the lossy projection the provider sees. `context.entries`
+is the lossless append-only branch — every compacted message is still there, plus
+`CompactionEntry.details` and `CustomEntry` records — so recovery tools and
+deterministic checkpoints read `entries`. See
+`dev-notes/extension-compaction-override.md`.
+
 ## Dynamic providers
 
 `tau.register_provider(DynamicProvider(...))` adds a frontend-free provider layer

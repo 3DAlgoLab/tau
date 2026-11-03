@@ -44,6 +44,10 @@ User-facing documentation lives in `website/content/` and is published at
   live interpreter per session, why its interrupt ladder is SIGINT-then-kill
   instead of a Jupyter control channel, and why that interpreter is the project's
   own `.venv` rather than whatever Python Tau happens to run on.
+- `extension-compaction-override.md` — the `session_before_compact` hook that lets
+  an extension replace Tau's model-generated summary, why every compaction trigger
+  funnels through one helper, and why `CompactionEntry.details` and the raw
+  `context.entries` branch exist for lossless recovery.
 - `web-search-extension.md` — how the shipped `web_search` example reaches five
   search backends and reads a page in reader mode, and why titles-only results,
   a rejected key, and class-named page chrome each needed their own rule instead

@@ -192,6 +192,8 @@ def setup(tau):
     tau.context.project_trust_resolution  # full ProjectTrustResolution, or None
     tau.context.is_running, tau.context.has_ui
     tau.context.transcript   # parent conversation, deep-copied AgentMessages
+    tau.context.entries      # raw active-branch SessionEntries, deep-copied
+    tau.context.context_window_tokens  # effective context window in tokens
 
     # host-framed sidebar sections (see "Sidebar sections" below)
     sidebar = getattr(tau.context.ui, "sidebar", None)
@@ -695,6 +697,7 @@ Lifecycle and intercepting hooks:
 | `input` | `InputEvent(text)` | `InputHookResult(action, text, message)` |
 | `tool_call` | `ToolCallHookEvent(tool_name, arguments)` | `ToolCallHookResult(block, reason, arguments)` |
 | `tool_result` | `ToolResultHookEvent(tool_name, arguments, result)` | `ToolResultHookResult(content, details)` |
+| `session_before_compact` | `SessionBeforeCompactEvent(reason, first_kept_entry_id, replaced_entry_ids, messages_to_summarize, tokens_before, context_window_tokens, custom_instructions)` | `SessionBeforeCompactResult(cancel, summary, details)` |
 
 - `session_start` fires once the host frontend is attached (Pi's ordering:
   the UI starts before extensions initialize), so handlers can call
@@ -707,6 +710,24 @@ Lifecycle and intercepting hooks:
   call. A crashing `tool_call` handler blocks the tool (fail-safe).
 - `tool_result` can rewrite a result's text `content` or `details`; execution
   error state belongs to the host's tool lifecycle rather than the result payload.
+- `session_before_compact` runs after Tau has chosen the compaction boundary and
+  before any summarizer runs, for `manual` (`/compact`), `threshold`, and
+  `overflow` compaction alike. Returning `summary` replaces Tau's model-generated
+  summary and Tau makes **no** summarization request; `details` is stored verbatim
+  on the resulting `CompactionEntry` for the extension to re-read later, and replay
+  ignores it (context is still rebuilt from `summary`). Returning `cancel=True`
+  skips this compaction outright: a manual `/compact` reports the cancellation, and
+  automatic compaction leaves the context untouched (an overflow-driven compaction
+  will ask again on the next request). The first decisive handler wins; a handler
+  that returns nothing leaves Tau in charge. Unlike `tool_call`, a crashing handler
+  is recorded as a diagnostic and Tau continues with model compaction, because
+  refusing to compact could strand a session that has outgrown its window.
+- `context.transcript` is the lossy active-context projection (compaction and
+  branch summaries folded in), while `context.entries` is the lossless append-only
+  record of the active branch, including `CompactionEntry` rows and their
+  `details`. A compaction override therefore reads raw history from `entries`, and
+  `event.messages_to_summarize` / `event.replaced_entry_ids` describe only the rows
+  leaving the projection.
 
 All other handler failures are contained: they are recorded as diagnostics
 (visible in `/session`) and never crash the session.
