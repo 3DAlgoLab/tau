@@ -57,5 +57,7 @@ User-facing documentation lives in `website/content/` and is published at
   escape codes.
 - `tui-latency-fixes.md` — profiled causes of slow prompt echo and startup, and
   the stamp-validated caches and scheduling changes that fixed them.
+- `tui-transcript-spacing-and-tool-runs.md` — the uniform one-blank-line block
+  rhythm, invisible whitespace-only blocks, and same-tool run continuation.
 
 The roadmap is tracked in [GitHub issue #1](https://github.com/huggingface/tau/issues/1).
