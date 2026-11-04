@@ -4467,7 +4467,10 @@ class ScriptedTurnProvider:
             message = turn()
             yield assistant_start(model=model)
             reason = message.stop_reason or "stop"
-            yield AssistantDoneEvent(reason=reason, message=message)
+            if reason == "error":
+                yield AssistantErrorEvent(reason="error", error=message)
+            else:
+                yield AssistantDoneEvent(reason=reason, message=message)
 
         return events()
 
@@ -4717,6 +4720,102 @@ async def test_truncation_recovery_stops_after_one_attempt(
     assert [(event.attempt, event.success) for event in retry_ends] == [(1, False)]
     assert retry_ends[0].final_error is not None
     assert "truncated" in retry_ends[0].final_error
+    assert sum(isinstance(event, AgentSettledEvent) for event in events) == 1
+
+
+@pytest.mark.anyio
+async def test_truncation_recovery_falls_back_to_the_window_when_auto_compaction_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The subagent shape: children are built with auto-compaction disabled, so the
+    # proactive threshold is None. A full-window truncation used to skip the
+    # compaction branch entirely and blindly re-send the same over-window prompt,
+    # which is how a child session settled on a provider 400. The window-derived
+    # threshold stands in and creates room first.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    monkeypatch.setattr("tau_coding.session.DEFAULT_CONTEXT_WINDOW_TOKENS", 32_768)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=30_000),
+            lambda: _answering_turn(text="Resuming the work.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_enabled=False,
+        )
+    )
+    assert session.auto_compact_token_threshold is None
+
+    events = await _collect_session_events(session.prompt("Do the thing."))
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    # Disabled auto-compaction removes the proactive threshold, not the physics:
+    # the window was the constraint, so recovery still makes room before continuing.
+    assert [entry.summary for entry in compactions] == ["Compacted summary 1"]
+    assert provider.summary_calls == 1
+    assert len(provider.conversational_calls) == 2
+    retry_ends = [event for event in events if isinstance(event, AutoRetryEndEvent)]
+    assert [(event.attempt, event.success) for event in retry_ends] == [(1, True)]
+    assert "Resuming the work." in [message.text for message in session.messages]
+
+
+@pytest.mark.anyio
+async def test_truncation_recovery_compacts_when_the_retry_is_rejected_as_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The live failure: the estimate undercounts dense content, so the truncation
+    # retry is rejected outright as over-window. The loop treats that like the main
+    # prompt path does: one more compaction, one more continue.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    overflow = (
+        "dpi1 request failed with status 400 for model coder1: request exceeds the "
+        "context window: prompt (131074 tokens) leaves no room to answer in the "
+        "context (131072); requests are never truncated"
+    )
+    provider = ScriptedTurnProvider(
+        [
+            lambda: _truncated_thinking_turn(usage_total=40_000),
+            lambda: AssistantMessage(stop_reason="error", error_message=overflow),
+            lambda: _answering_turn(text="Recovered.", usage_total=1_200),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            auto_compact_token_threshold=20_000,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Do the thing."))
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert [entry.summary for entry in compactions] == [
+        "Compacted summary 1",
+        "Compacted summary 2",
+    ]
+    assert [event.attempt for event in events if isinstance(event, AutoRetryStartEvent)] == [1, 2]
+    assert [
+        (event.attempt, event.success) for event in events if isinstance(event, AutoRetryEndEvent)
+    ] == [(2, True)]
+    assert len(provider.conversational_calls) == 3
+    assert "Recovered." in [message.text for message in session.messages]
+    # Still one run: the whole repair happens before a single settle.
     assert sum(isinstance(event, AgentSettledEvent) for event in events) == 1
 
 

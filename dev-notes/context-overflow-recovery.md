@@ -158,6 +158,56 @@ is built from `harness.continue_()`, the same primitive the TUI uses for a manua
 - A `length` turn that carries a tool call is left alone: the loop already continues that
   run to execute the call.
 
+## Third phase: the subagent whose recovery answered itself with a 400
+
+The same chain failed a third time, in a `tau-subagents` child session. The child
+is built with auto-compaction disabled, so `auto_compact_token_threshold` is
+`None`, and the transcript grew to 130,581 of 131,072 tokens unimpeded. A turn
+truncated at the limit with a thinking block only, recovery ran, and skipped the
+compaction branch - `threshold is None` read as "the window is not the
+constraint". The continue re-sent the same over-window prompt, now with the
+truncated assistant message appended: 131,074 tokens, rejected with a 400, and
+the single-attempt budget made that terminal. The `agent-calls.jsonl` diagnostic
+records `phase: "truncation_recovery"` on the rejected request.
+
+Two gaps, both inside `_recover_from_truncated_turn`:
+
+1. "No proactive threshold" was conflated with "no window". Disabling
+   auto-compaction removes the *request* to compact; it does not remove the
+   context window. A full-window truncation is the constraint announcing itself
+   regardless of what policy the session runs.
+2. A retry rejected as over-window had no recovery, mirroring exactly the gap the
+   main prompt path closed with `MAX_OVERFLOW_RECOVERIES`.
+
+### What changed
+
+- When the effective auto-compaction threshold is `None`, recovery falls back to
+  the window-derived one (`auto_compaction_threshold_for_context_window`). A
+  subagent with auto-compaction off now compacts on a full-window truncation
+  before continuing, instead of blindly re-sending the oversized prompt.
+- The single continue is now a bounded loop (`MAX_TRUNCATION_RECOVERIES = 2`).
+  If the retry is rejected as over-window (`is_context_overflow_error`), one
+  overflow compaction and one more continue repair it, emitting the same
+  `CompactionStartEvent`/`CompactionEndEvent` with `reason="overflow"` the main
+  prompt path uses. `AutoRetryEndEvent.attempt` can now be 2.
+- A second *truncation* still ends the run: the extra budget is for rejections,
+  not for a model that keeps overflowing its own output cap. That distinction is
+  why the loop counts attempts but only the overflow branch spends a second.
+
+### Behavior changes
+
+- Subagent sessions (auto-compaction off) no longer end on a provider 400 after
+  a full-window truncation; expect a compaction line and a retry line instead.
+- A truncation retry that is rejected as over-window compacts and continues once
+  more instead of reporting the provider error as the final failure.
+
+### Validation
+
+New coverage:
+
+- `tests/test_coding_session.py::test_truncation_recovery_falls_back_to_the_window_when_auto_compaction_is_off`
+- `tests/test_coding_session.py::test_truncation_recovery_compacts_when_the_retry_is_rejected_as_overflow`
+
 ## Validation
 
 New coverage:

@@ -185,10 +185,13 @@ TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before u
 # refill the window; recovery repeats instead of ending on a second 400.
 MAX_OVERFLOW_RECOVERIES = 2
 # How many times one run may compact and continue after the provider truncates a
-# response at the limit (`stop_reason == "length"`). One attempt is deliberate: a
-# second truncation means the model keeps producing more than the window can
-# hold, which is a decision for the user, not something to keep paying for.
-MAX_TRUNCATION_RECOVERIES = 1
+# response at the limit (`stop_reason == "length"`). The first continue repairs
+# the truncation; a second budget covers a retry that the provider rejects as
+# over-window, where one compaction plus one more continue is the repair. A
+# second *truncation* still ends the run: the model keeps producing more than
+# the window can hold, which is a decision for the user, not something to keep
+# paying for.
+MAX_TRUNCATION_RECOVERIES = 2
 
 
 def _run_ended_on_empty_truncation(message: AssistantMessage | None) -> bool:
@@ -4077,8 +4080,14 @@ class CodingSession:
         not the constraint the truncation came from the model's own output cap, so
         continuing alone is the whole repair and compaction would only cost a
         request.
+
+        With auto-compact disabled there is no proactive threshold, so the
+        window-derived one stands in: without it a full-window truncation would
+        blindly re-send the same over-window prompt and settle on a 400.
         """
         threshold = self.auto_compact_token_threshold
+        if threshold is None:
+            threshold = auto_compaction_threshold_for_context_window(self.context_window_tokens)
         if threshold is not None and self.context_token_estimate > threshold:
             start = CompactionStartEvent(reason="threshold")
             await self._extension_runtime.emit_event(start)
@@ -4097,39 +4106,71 @@ class CodingSession:
             yield end
             if not compacted:
                 return
-        # One continue, reported through the same retry events the overflow recovery
-        # uses so the TUI and extensions see a recovery they can render.
-        retry_start = AutoRetryStartEvent(
-            attempt=1,
-            max_attempts=MAX_TRUNCATION_RECOVERIES,
-            delay_ms=0,
-            error_message="Response truncated at the model output limit",
-        )
-        await self._extension_runtime.emit_event(retry_start)
-        yield retry_start
+        # Continue, reported through the same retry events the overflow recovery
+        # uses so the TUI and extensions see a recovery they can render. If the
+        # retry is rejected as over-window (the estimate can undercount dense
+        # content), one compaction and one more continue is the repair, matching
+        # the main prompt path's overflow loop.
         failure: str | None = None
-        events = self._harness.continue_()
-        self._invalidate_context_usage_cache()
-        async for event in events:
-            if isinstance(event, ToolExecutionEndEvent):
-                self._invalidate_context_usage_cache()
-            if isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
-                if event.message.stop_reason == "length":
-                    failure = "Response truncated at the model output limit again"
-                elif event.message.stop_reason in {"error", "aborted"}:
-                    failure = event.message.error_message or "Provider request aborted"
-                    self._last_diagnostic_log_path = self._diagnostic_logger.log_assistant_error(
-                        context=context,
-                        phase="truncation_recovery",
-                        message=event.message,
-                    )
-            if isinstance(event, AgentEndEvent):
-                yield SessionAgentEndEvent(messages=event.messages, will_retry=False)
-            else:
-                yield event
+        attempt = 0
+        for attempt in range(1, MAX_TRUNCATION_RECOVERIES + 1):
+            retry_start = AutoRetryStartEvent(
+                attempt=attempt,
+                max_attempts=MAX_TRUNCATION_RECOVERIES,
+                delay_ms=0,
+                error_message="Response truncated at the model output limit",
+            )
+            await self._extension_runtime.emit_event(retry_start)
+            yield retry_start
+            failure = None
+            retry_overflow: AssistantMessage | None = None
+            events = self._harness.continue_()
+            self._invalidate_context_usage_cache()
+            async for event in events:
+                if isinstance(event, ToolExecutionEndEvent):
+                    self._invalidate_context_usage_cache()
+                if isinstance(event, MessageEndEvent) and isinstance(
+                    event.message, AssistantMessage
+                ):
+                    if event.message.stop_reason == "length":
+                        failure = "Response truncated at the model output limit again"
+                    elif event.message.stop_reason in {"error", "aborted"}:
+                        failure = event.message.error_message or "Provider request aborted"
+                        self._last_diagnostic_log_path = (
+                            self._diagnostic_logger.log_assistant_error(
+                                context=context,
+                                phase="truncation_recovery",
+                                message=event.message,
+                            )
+                        )
+                        if event.message.stop_reason == "error" and is_context_overflow_error(
+                            event.message
+                        ):
+                            retry_overflow = event.message
+                if isinstance(event, AgentEndEvent):
+                    yield SessionAgentEndEvent(messages=event.messages, will_retry=False)
+                else:
+                    yield event
+            if retry_overflow is None or attempt >= MAX_TRUNCATION_RECOVERIES:
+                break
+            recovery_start = CompactionStartEvent(reason="overflow")
+            await self._extension_runtime.emit_event(recovery_start)
+            yield recovery_start
+            recovered = await self._try_overflow_compact(context=context)
+            recovery_end = CompactionEndEvent(
+                reason="overflow",
+                result=None,
+                aborted=not recovered,
+                will_retry=recovered,
+                error_message=None if recovered else "Overflow compaction failed",
+            )
+            await self._extension_runtime.emit_event(recovery_end)
+            yield recovery_end
+            if not recovered:
+                break
         retry_end = AutoRetryEndEvent(
             success=failure is None,
-            attempt=1,
+            attempt=attempt,
             final_error=failure,
         )
         await self._extension_runtime.emit_event(retry_end)
