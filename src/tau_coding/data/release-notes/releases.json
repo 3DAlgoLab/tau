@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.4.9.post1",
+    "date": "2026-11-05",
+    "sections": {
+      "Changed": [
+        "Track upstream Tau 0.4.9 as a post-release, so a fork build reports a version of its own and stops offering an update to the release it already carries."
+      ]
+    }
+  },
+  {
     "version": "0.4.9",
     "date": "2026-11-03",
     "sections": {
