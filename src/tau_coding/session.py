@@ -62,6 +62,7 @@ from tau_coding.context_window import (
     build_compaction_summary_prompt,
     estimate_context_usage,
     estimate_message_tokens,
+    provider_prompt_floor_tokens,
     summarize_messages_for_compaction,
 )
 from tau_coding.credentials import FileCredentialStore, credentials_path
@@ -194,18 +195,30 @@ MAX_OVERFLOW_RECOVERIES = 2
 MAX_TRUNCATION_RECOVERIES = 2
 
 
-def _run_ended_on_empty_truncation(message: AssistantMessage | None) -> bool:
-    """Return whether a settled run ended on a truncated turn with no output.
+def _run_ended_on_recoverable_truncation(
+    message: AssistantMessage | None,
+    *,
+    window_pressure: bool,
+) -> bool:
+    """Return whether a settled run ended on a truncation this session can repair.
 
     A `length` stop is the provider saying it ran out of room mid-response. When
-    the turn still carried text or a tool call, the user can read the partial
-    answer and decide what to do. When it carried only thinking, the run settled
-    with nothing visible at all, which is indistinguishable from the agent going
-    silent, and nothing else in the session resumes it.
+    the turn carried only thinking, the run settled with nothing visible at all,
+    which is indistinguishable from the agent going silent, and nothing outside
+    this recovery resumes it — so it is always repaired.
+
+    When the turn still carried text or a tool call, the user can read the
+    partial answer, so recovery only steps in when the window is the constraint:
+    compaction is what creates room, and a truncated answer at a full window
+    repeats identically otherwise. Without that pressure the truncation came from
+    the model's own output cap, where continuing would just truncate again and a
+    compaction would cost a request for nothing.
     """
     if message is None or message.stop_reason != "length" or message.tool_calls:
         return False
-    return not message_text(message).strip()
+    if not message_text(message).strip():
+        return True
+    return window_pressure
 
 
 async def _await_cleanup_completion[CleanupResult](
@@ -1279,6 +1292,39 @@ class CodingSession:
     def has_provider_context_usage(self) -> bool:
         """Return whether valid provider usage anchors the active context count."""
         return self.context_usage.uses_provider_usage
+
+    @property
+    def provider_prompt_floor_tokens(self) -> int:
+        """Return the prompt size the provider itself last measured for this context.
+
+        A character-based estimate is a guess; a provider's reported input side is
+        a measurement of the prompt it accepted, and the next request can only be
+        larger. It is the number to trust when an estimate and a rejected request
+        disagree.
+        """
+        return provider_prompt_floor_tokens(self._harness.messages)
+
+    def _context_pressure_tokens(self) -> int:
+        """Return the strongest available count of the context a request would send.
+
+        The estimate anchors on provider usage when a still-valid usage block
+        exists and falls back to counting characters when it does not, so it can
+        undercount. The provider floor never overcounts. Taking the larger of the
+        two keeps a compaction trigger working in exactly the case where the
+        estimate has gone blind: a session resumed after a compaction, whose
+        usage blocks were written before it.
+        """
+        return max(self.context_token_estimate, self.provider_prompt_floor_tokens)
+
+    def _context_at_window(self) -> bool:
+        """Return whether the provider's own usage says the window is nearly full.
+
+        Deliberately the provider's count rather than the estimate: this gates a
+        repair that costs a compaction, and a fallback estimate has already shown
+        it cannot see the pressure.
+        """
+        threshold = auto_compaction_threshold_for_context_window(self.context_window_tokens)
+        return threshold is not None and self.provider_prompt_floor_tokens >= threshold
 
     @property
     def context_usage(self) -> ContextUsageEstimate:
@@ -3207,7 +3253,7 @@ class CodingSession:
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             raise ValueError("Not enough context to compact while preserving recent entries")
-        tokens_before = self.context_token_estimate
+        tokens_before = self._context_pressure_tokens()
         generated = await self._compaction_summary_for_plan(
             plan,
             reason="manual",
@@ -3601,7 +3647,9 @@ class CodingSession:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
             else:
-                if _run_ended_on_empty_truncation(last_assistant):
+                if _run_ended_on_recoverable_truncation(
+                    last_assistant, window_pressure=self._context_at_window()
+                ):
                     async for recovery_event in self._recover_from_truncated_turn(context=context):
                         yield recovery_event
                 await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
@@ -3671,7 +3719,9 @@ class CodingSession:
             if route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
-            elif _run_ended_on_empty_truncation(last_assistant):
+            elif _run_ended_on_recoverable_truncation(
+                last_assistant, window_pressure=self._context_at_window()
+            ):
                 async for recovery_event in self._recover_from_truncated_turn(context=context):
                     yield recovery_event
             await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
@@ -4043,7 +4093,7 @@ class CodingSession:
             plan = self._recent_preserving_compaction_plan()
             if plan is None:
                 return False
-            tokens_before = self.context_token_estimate
+            tokens_before = self._context_pressure_tokens()
             generated = await self._compaction_summary_for_plan(plan, reason="overflow")
             if generated is None:
                 return False
@@ -4088,7 +4138,7 @@ class CodingSession:
         threshold = self.auto_compact_token_threshold
         if threshold is None:
             threshold = auto_compaction_threshold_for_context_window(self.context_window_tokens)
-        if threshold is not None and self.context_token_estimate > threshold:
+        if threshold is not None and self._context_pressure_tokens() > threshold:
             start = CompactionStartEvent(reason="threshold")
             await self._extension_runtime.emit_event(start)
             yield start
@@ -4281,12 +4331,16 @@ class CodingSession:
             return False
         if len(self._state.context_entry_ids) < 2:
             return False
-        if self.context_token_estimate <= threshold:
+        # The provider floor is checked alongside the estimate on purpose: after
+        # a compaction the estimate loses its usage anchor (older usage describes
+        # the context the summary replaced) and a character count can sit far
+        # below a context the provider is already rejecting.
+        if self._context_pressure_tokens() <= threshold:
             return False
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             return False
-        tokens_before = self.context_token_estimate
+        tokens_before = self._context_pressure_tokens()
         generated = await self._compaction_summary_for_plan(plan, reason="threshold")
         if generated is None:
             return False
@@ -4368,7 +4422,11 @@ class CodingSession:
                     first_kept_entry_id=plan.first_kept_entry_id,
                     replaced_entry_ids=plan.replaced_entry_ids,
                     messages_to_summarize=plan.messages_to_summarize,
-                    tokens_before=self.context_token_estimate,
+                    # The strongest count Tau has, not merely the estimate: a
+                    # handler deciding whether this compaction is the last one its
+                    # session will ever get needs the number the provider itself
+                    # reported, which an estimate can fall well short of.
+                    tokens_before=self._context_pressure_tokens(),
                     context_window_tokens=self.context_window_tokens,
                     custom_instructions=custom_instructions,
                 )

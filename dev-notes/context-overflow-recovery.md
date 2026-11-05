@@ -208,6 +208,124 @@ New coverage:
 - `tests/test_coding_session.py::test_truncation_recovery_falls_back_to_the_window_when_auto_compaction_is_off`
 - `tests/test_coding_session.py::test_truncation_recovery_compacts_when_the_retry_is_rejected_as_overflow`
 
+## Fourth phase: the session that died with its recovery budget spent
+
+The third phase fixed a child session. The parent died anyway.
+`~/.tau/sessions/home-my-vault-20-ai_and_agent-bab571/96beebd123074b188f01a2e02d22bc43.jsonl`
+(897 lines) ends mid-sentence with a provider rejection and nothing after it:
+
+| line | time | what happened |
+| --- | --- | --- |
+| 625 | 03:11:43 | 400 at 131,239 tokens; line 626 compacts (`reason="overflow"`, `tokens_before=131,199`) |
+| 785 | 05:42:23 | 400 at 131,131; line 786 compacts (`reason="overflow"`, `tokens_before=131,165`) — the second and last `MAX_OVERFLOW_RECOVERIES` |
+| 869 | 06:51:55 | the provider reports 115,511 input tokens; the auto-compaction threshold for a 131,072 window is 114,688, so this is already over |
+| 891, 893, 895 | 07:15-07:16 | three turns end `stop_reason="length"` at 131,064 of 131,072, each carrying readable text (451, 267, 86 output tokens) |
+| 897 | 07:17:57 | 400 at 131,161. No compaction entry follows. `index.jsonl`'s `updated_at` is this timestamp |
+
+Both recoveries had been spent hours earlier, so the third rejection had nothing
+left to spend. Two things had to be true for the session to reach it, and both turned
+out to be defects.
+
+### The proactive guard went blind at exactly the moment it mattered
+
+Between line 869 (over threshold) and line 897 there are 28 provider calls, every one
+of which passes `run_agent_loop`'s request-boundary check, and none of which compacts.
+The check compares `context_token_estimate` with the threshold, and the estimate had
+fallen to 98,767 while the provider reported 115,511.
+
+The cause is in `tau_agent/session/memory.py`. On re-read, the compaction summary row is
+*synthesized* — and it was synthesized as a `UserMessage(content=...)` with no
+timestamp, so it took the wall clock of the replay. A reloaded session therefore holds
+its summary newer than every message that summary covers.
+`_last_applicable_provider_usage` requires the anchor to sit at or after the newest
+boundary, so on replay it rejects every recorded usage, the provider anchor dies, and
+the estimate falls back to chars/4:
+
+| compaction | `tokens_before` recorded live | the same state after a reload |
+| --- | --- | --- |
+| line 313 | 115,711 | 83,991 |
+| line 449 | 116,041 | 83,372 |
+| line 626 | 131,199 | 97,349 |
+| line 786 | 131,165 | 98,813 |
+
+At 03:06 the session was resumed and its first request-boundary check compared 97,349
+against 114,688. The provider was at 119,194. Custom messages already take their
+timestamp from the entry (`round(entry.timestamp * 1000)`); the compaction and
+branch-summary rows were the two rows that did not.
+
+### A full window was not allowed to be the constraint
+
+The three truncations at 131,064 carried text, and `_run_ended_on_empty_truncation`
+recovered only silent ones — the phase-two rule, reasoning first. So the model answered
+451 tokens, got cut off, the run settled, the same context was sent again, and it
+happened three times before the provider rejected the request. That rule is correct when
+the model ran out of *output* room. At 131,064 of 131,072 the window ran out, and
+re-sending the same prompt only refills the same buffer.
+
+### What changed
+
+- `tau_agent/session/memory.py`: synthesized compaction-summary and branch-summary rows
+carry the entry's timestamp. Replay of one branch is now one timeline, and the provider
+anchor survives a reload.
+- `tau_coding/context_window.py`: `provider_prompt_floor_tokens(messages)` returns the
+largest input side any provider response measured since the newest summarization
+boundary. It is a lower bound, never a guess, and it survives an unusable anchor —
+including a zero-usage summarization response, which is what a stubbed or offline
+summarizer records. `estimate_context_usage` returns the larger of its two answers, so an
+anchor that cannot be used still contributes its measurement; when it can be used, that
+number is already inside it.
+- `tau_coding/session.py`: `_context_pressure_tokens()` is the one number the threshold
+check, the truncation-recovery check, a manual compaction's `tokens_before`, and the
+`session_before_compact` event all use. A handler deciding whether this compaction is the
+last one its session will ever get needs the count the provider itself reported.
+- `_run_ended_on_empty_truncation` became `_run_ended_on_recoverable_truncation`, which
+takes the window: text-carrying truncations are recoverable when the measured context is
+over the threshold, and still left to the user when it is not.
+- `transparent-compact` (separate repository) can no longer refuse a window-critical
+compaction, and records every decision it makes on the hook, so a declined compaction is
+a session entry rather than a toast.
+
+### Behavior changes
+
+- A reload no longer resets the estimate. A session resumed after a compaction now
+  auto-compacts at the threshold the provider has already crossed instead of running ~20k
+  tokens past it.
+- A truncated turn that carried text compacts and continues when the window is the
+  constraint; a truncated turn under no window pressure still ends the run for the user
+  to continue.
+- `estimate_context_usage` can return a provider-reported number where it previously
+  returned a character estimate, so a session whose summarizer records no usage can still
+  auto-compact on the next turn.
+
+### Limitations
+
+- A floor is a floor: it says nothing about what was appended after the response that
+  measured it, so it can under-count. It cannot over-count, which is why it triggers
+  compaction rather than deciding how much to keep.
+- The third rejection in the observed session was still fatal. The fixes above would have
+  compacted at line 870; they do not add a third overflow recovery. A session that spends
+  its whole budget before anything is wrong has a different problem than this one had.
+
+### Validation
+
+New coverage:
+
+- `tests/test_compaction_replay_accounting.py` — the summary row is stamped from its
+  entry, replaying a branch twice is identical, the anchor survives a reload, and a
+  zero-usage boundary still leaves a floor.
+- `tests/test_context_window.py` — floor tests, including that a boundary with no usage
+  does not discard earlier measurements.
+- `tests/test_coding_session.py::test_session_recovers_a_truncated_text_turn_at_a_full_window`
+
+Run:
+
+```bash
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+```
+
 ## Validation
 
 New coverage:

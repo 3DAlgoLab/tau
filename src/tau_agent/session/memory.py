@@ -106,7 +106,13 @@ class SessionState:
                     )
                 case "branch_summary":
                     message_rows.append(
-                        (entry.id, UserMessage(content=_format_branch_summary(entry)))
+                        (
+                            entry.id,
+                            UserMessage(
+                                content=_format_branch_summary(entry),
+                                timestamp=_entry_timestamp_ms(entry),
+                            ),
+                        )
                     )
 
         return cls(
@@ -148,13 +154,34 @@ def _last_non_leaf_id(entries: list[SessionEntry]) -> str | None:
     return None
 
 
+def _entry_timestamp_ms(entry: SessionEntry) -> int:
+    """Return an entry's own wall clock in the millisecond scale messages use.
+
+    Entries carry seconds and messages carry milliseconds. A rebuilt message has
+    to keep the entry's time rather than the replay's: `AgentMessage.timestamp`
+    defaults to *now*, so every message reconstructed from an entry would
+    otherwise be stamped after everything that followed it. Context accounting
+    reads that order — `estimate_context_usage` drops a provider usage block as
+    soon as a message stamped after it rewrote the prefix — so a wall-clock
+    dependent rebuild silently reports a different context size for the same
+    bytes of session, live and replayed.
+    """
+    return round(entry.timestamp * 1000)
+
+
 def _apply_compaction(
     message_rows: list[tuple[str, AgentMessage]],
     entry: CompactionEntry,
     *,
     path_before: list[SessionEntry],
 ) -> list[tuple[str, AgentMessage]]:
-    summary_row = (entry.id, UserMessage(content=_format_compaction_summary(entry.summary)))
+    summary_row = (
+        entry.id,
+        UserMessage(
+            content=_format_compaction_summary(entry.summary),
+            timestamp=_entry_timestamp_ms(entry),
+        ),
+    )
 
     # Tau originally persisted arbitrary replacement-id sets. Explicit legacy
     # fields take precedence, including an empty list, so old sessions retain

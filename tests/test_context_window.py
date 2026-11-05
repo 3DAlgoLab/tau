@@ -3,6 +3,7 @@ from pathlib import Path
 from tau_agent import AssistantMessage, TextContent, ToolCall, ToolResultMessage, Usage, UserMessage
 from tau_agent.messages import assistant_content
 from tau_coding.context_window import (
+    COMPACTION_SUMMARY_PREFIX,
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
     build_compaction_summary_prompt,
@@ -10,6 +11,7 @@ from tau_coding.context_window import (
     estimate_context_usage,
     estimate_message_tokens,
     estimate_text_tokens,
+    provider_prompt_floor_tokens,
     serialize_messages_for_compaction,
     summarize_messages_for_compaction,
 )
@@ -104,6 +106,62 @@ def test_auto_compaction_threshold_keeps_pi_style_reserve() -> None:
     assert auto_compaction_threshold_for_context_window(128_000) == 111_616
     assert auto_compaction_threshold_for_context_window(16_384) == 1
     assert auto_compaction_threshold_for_context_window(0) is None
+
+
+def test_provider_prompt_floor_is_the_accepted_prompt_without_the_reply() -> None:
+    older = AssistantMessage(
+        content="earlier",
+        usage=Usage(input=1_000, cache_read=900, output=50, total_tokens=1_950),
+        timestamp=100,
+    )
+    newest = AssistantMessage(
+        content="later",
+        usage=Usage(input=40_000, cache_read=70_000, cache_write=1_000, output=500),
+        timestamp=200,
+    )
+    trailing = UserMessage(content="more", timestamp=250)
+
+    floor = provider_prompt_floor_tokens((older, trailing, newest))
+
+    # The prompt the provider accepted, excluding what it wrote back: the next
+    # request carries that prefix plus whatever came after.
+    assert floor == 111_000
+
+
+def test_provider_prompt_floor_ignores_rejected_and_unmeasured_responses() -> None:
+    measured = AssistantMessage(
+        content="answer",
+        usage=Usage(input=120_000, cache_read=1_000, total_tokens=121_500),
+        timestamp=100,
+    )
+    rejected = AssistantMessage(
+        content="",
+        stop_reason="error",
+        error_message="prompt exceeds the context window",
+        usage=Usage(input=131_000, total_tokens=131_000),
+        timestamp=200,
+    )
+    unmeasured = AssistantMessage(content="no usage", timestamp=300)
+
+    assert provider_prompt_floor_tokens((measured, rejected, unmeasured)) == 121_000
+
+
+def test_provider_prompt_floor_stops_at_a_compaction_summary() -> None:
+    before = AssistantMessage(
+        content="answer",
+        usage=Usage(input=100_000, cache_read=20_000, total_tokens=120_500),
+        timestamp=100,
+    )
+    summary = UserMessage(
+        content=f"{COMPACTION_SUMMARY_PREFIX}## Goal\nKeep going.",
+        timestamp=200,
+    )
+
+    # Usage measured before a compaction priced context the summary replaced, so it
+    # can only overstate what the next request will carry. Messages retained across
+    # a compaction keep their own place after the summary row, so they still count.
+    assert provider_prompt_floor_tokens((before, summary)) == 0
+    assert provider_prompt_floor_tokens((summary, before)) == 120_000
 
 
 def test_context_usage_estimate_reports_breakdown(tmp_path: Path) -> None:

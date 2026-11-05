@@ -183,6 +183,39 @@ def provider_context_tokens(message: AssistantMessage) -> int:
     return usage.total_tokens or (usage.input + usage.output + usage.cache_read + usage.cache_write)
 
 
+def provider_prompt_floor_tokens(messages: tuple[AgentMessage, ...]) -> int:
+    """Return the prompt size the provider last measured for this context.
+
+    A successful response's input side (`input + cache_read + cache_write`) is the
+    exact token count the provider accepted for a prefix of the active context.
+    The next request carries that same prefix plus whatever has been appended
+    since, so its prompt can only be at least this large. Unlike an estimate, it
+    needs no tokenizer and cannot drift: it is the number that a provider's own
+    "prompt exceeds the context window" rejection is computed from.
+
+    The scan stops at the newest compaction summary. Usage recorded before one
+    describes context that summary replaced, which the next request will not
+    carry, so it can only overstate. Responses that ended in `error` or `aborted`
+    are skipped as well: a rejected request measured a prompt the provider
+    refused, not this context.
+    """
+    for message in reversed(messages):
+        if isinstance(message, UserMessage) and message_text(message).startswith(
+            COMPACTION_SUMMARY_PREFIX
+        ):
+            break
+        if not isinstance(message, AssistantMessage) or message.stop_reason in {
+            "aborted",
+            "error",
+        }:
+            continue
+        usage = message.usage
+        prompt_tokens = usage.input + usage.cache_read + usage.cache_write
+        if prompt_tokens > 0:
+            return prompt_tokens
+    return 0
+
+
 def _last_applicable_provider_usage(
     messages: tuple[AgentMessage, ...],
 ) -> tuple[int, int] | None:

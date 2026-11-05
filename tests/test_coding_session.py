@@ -4686,6 +4686,61 @@ async def test_session_does_not_recover_a_truncated_turn_that_produced_text(
 
 
 @pytest.mark.anyio
+async def test_session_recovers_a_truncated_text_turn_at_a_full_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The observed death: the provider stopped the answer mid-sentence at its own
+    # 131 072-token window, turns in a row, and the run settled on a rejected
+    # request. A cut-off answer is the user's to continue only while there is room;
+    # when the provider's own input count says the window is full, the same prompt
+    # gets sent again and truncated again, so making room is the repair.
+    monkeypatch.setattr("tau_coding.session.DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 10)
+    storage = JsonlSessionStorage(tmp_path / "window-roof.jsonl")
+    provider = ScriptedTurnProvider(
+        [
+            lambda: AssistantMessage(
+                content="An answer cut off mid-sent",
+                usage=Usage(input=130_876, output=451, total_tokens=131_327),
+                stop_reason="length",
+            ),
+            lambda: _answering_turn(text="Resuming with room.", usage_total=9_000),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_echo_tool()],
+            provider_name="local",
+            provider_settings=ProviderSettings(
+                default_provider="local",
+                providers=(
+                    OpenAICompatibleProviderConfig(
+                        name="local",
+                        models=("fake",),
+                        default_model="fake",
+                        context_windows={"fake": 131_072},
+                    ),
+                ),
+            ),
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Explain it."))
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    # The provider's measured input side (130 876) is what proves the window was the
+    # constraint: a character estimate of this short transcript would not have.
+    assert compactions, "a truncated turn at a full window has to make room"
+    assert any(isinstance(event, AutoRetryStartEvent) for event in events)
+    assert "Resuming with room." in [message.text for message in session.messages]
+
+
+@pytest.mark.anyio
 async def test_truncation_recovery_stops_after_one_attempt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
