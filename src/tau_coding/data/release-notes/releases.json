@@ -1,5 +1,24 @@
 [
   {
+    "version": "0.4.9.post2",
+    "date": "2026-11-05",
+    "sections": {
+      "New": [
+        "Let an extension own the compaction summary with the `session_before_compact` hook: supply the summary or cancel the summarization request, for manual, threshold, overflow and truncation triggers alike.",
+        "Give a hook what it needs to decide that: `entries` and `context_window_tokens` on the extension context, `CompactionPlan.replaced_entry_ids`, and `CompactionEntry.details` on the written entry."
+      ],
+      "Changed": [
+        "Check the compaction threshold before every provider request, not only at prompt boundaries, so a long tool-calling run can no longer reach the hard limit between turns.",
+        "Anchor context accounting to provider-measured usage: a replayed session keeps one timeline, and an estimate never falls below the largest prompt a provider already accepted."
+      ],
+      "Fixed": [
+        "Recover from repeated context overflow: an overflow inside a retry compacts and retries again instead of ending the run on a provider error.",
+        "Treat a response cut off at the length limit while carrying text as recoverable when measured context is over the threshold, instead of re-sending a prompt that refills the same full window.",
+        "Keep the provider measurements a session already has when a newer one is unusable, so one zero-token response no longer erases the accounting for the whole context."
+      ]
+    }
+  },
+  {
     "version": "0.4.9.post1",
     "date": "2026-11-05",
     "sections": {
