@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.4.9.post3",
+    "date": "2026-11-06",
+    "sections": {
+      "Fixed": [
+        "Let context accounting forget a compaction's old price: a provider-measured prompt floor now counts only responses dated after the newest compaction summary, so a session that just compacted to half its window is no longer held at its pre-compaction size and asked to compact again.",
+        "Record the entries a compaction replaces on the entry it writes, so a fold that starts inside the window an earlier fold kept retires that summary instead of stacking a second summary in front of it and growing the context at every compaction."
+      ]
+    }
+  },
+  {
     "version": "0.4.9.post2",
     "date": "2026-11-05",
     "sections": {

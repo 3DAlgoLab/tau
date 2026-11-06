@@ -48,6 +48,10 @@ User-facing documentation lives in `website/content/` and is published at
   an extension replace Tau's model-generated summary, why every compaction trigger
   funnels through one helper, and why `CompactionEntry.details` and the raw
   `context.entries` branch exist for lossless recovery.
+- `compaction-pressure-and-retired-summaries.md` — how a session came to summarize a
+  context that was not near its window: a provider-measured floor that never reset at a
+  compaction, and a fold that kept the summary it replaced because its boundary could
+  not name it. Includes a third failure left unfixed, with the evidence for it.
 - `web-search-extension.md` — how the shipped `web_search` example reaches five
   search backends and reads a page in reader mode, and why titles-only results,
   a rejected key, and class-named page chrome each needed their own rule instead
