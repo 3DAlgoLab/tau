@@ -1309,10 +1309,12 @@ class CodingSession:
 
         The estimate anchors on provider usage when a still-valid usage block
         exists and falls back to counting characters when it does not, so it can
-        undercount. The provider floor never overcounts. Taking the larger of the
-        two keeps a compaction trigger working in exactly the case where the
-        estimate has gone blind: a session resumed after a compaction, whose
-        usage blocks were written before it.
+        undercount. The provider floor never overcounts, because it carries only a
+        number the provider measured for a prompt that is still being sent. Taking
+        the larger of the two keeps a compaction trigger working in exactly the
+        case where the estimate has gone blind: a session resumed after a
+        compaction is floored by the first response measured since that summary,
+        not by the prefix the summary threw away.
         """
         return max(self.context_token_estimate, self.provider_prompt_floor_tokens)
 
@@ -3264,6 +3266,7 @@ class CodingSession:
         await self._append_compaction(
             generated.text,
             first_kept_entry_id=plan.first_kept_entry_id,
+            replaced_entry_ids=plan.replaced_entry_ids,
             tokens_before=tokens_before,
             usage=generated.usage,
             provider=generated.provider,
@@ -4100,6 +4103,7 @@ class CodingSession:
             await self._append_compaction(
                 generated.text,
                 first_kept_entry_id=plan.first_kept_entry_id,
+                replaced_entry_ids=plan.replaced_entry_ids,
                 tokens_before=tokens_before,
                 usage=generated.usage,
                 provider=generated.provider,
@@ -4331,10 +4335,11 @@ class CodingSession:
             return False
         if len(self._state.context_entry_ids) < 2:
             return False
-        # The provider floor is checked alongside the estimate on purpose: after
-        # a compaction the estimate loses its usage anchor (older usage describes
-        # the context the summary replaced) and a character count can sit far
-        # below a context the provider is already rejecting.
+        # The provider floor is checked alongside the estimate on purpose: a
+        # character estimate can sit far below a context the provider is already
+        # rejecting, and right after a compaction it has no usage anchor at all.
+        # The floor is the one number that cannot overstate, and it stops counting
+        # once a compaction has replaced the prefix it measured.
         if self._context_pressure_tokens() <= threshold:
             return False
         plan = self._recent_preserving_compaction_plan()
@@ -4347,6 +4352,7 @@ class CodingSession:
         await self._append_compaction(
             generated.text,
             first_kept_entry_id=plan.first_kept_entry_id,
+            replaced_entry_ids=plan.replaced_entry_ids,
             tokens_before=tokens_before,
             usage=generated.usage,
             provider=generated.provider,
@@ -4511,6 +4517,7 @@ class CodingSession:
         summary: str,
         *,
         first_kept_entry_id: str,
+        replaced_entry_ids: tuple[str, ...] = (),
         tokens_before: int | None = None,
         usage: Usage | None = None,
         provider: str | None = None,
@@ -4520,11 +4527,20 @@ class CodingSession:
     ) -> CompactionEntry:
         if first_kept_entry_id not in self._state.context_entry_ids:
             raise ValueError("First kept entry is not in the active context")
+        # A kept boundary cannot describe every fold. A second compaction may start
+        # inside the window the first one kept, and then the row it supersedes sits
+        # *after* that boundary: replaying from the boundary alone keeps both
+        # summaries and the context grows at every compaction. Recording the exact
+        # replaced rows is what lets replay drop the summary this one replaces.
+        replaces = [
+            entry_id for entry_id in replaced_entry_ids if entry_id in self._state.context_entry_ids
+        ]
 
         compaction = CompactionEntry(
             parent_id=self._last_parent_id,
             summary=summary,
             first_kept_entry_id=first_kept_entry_id,
+            replaces_entry_ids=replaces,
             tokens_before=tokens_before,
             usage=usage,
             provider=provider,

@@ -158,10 +158,51 @@ def test_provider_prompt_floor_stops_at_a_compaction_summary() -> None:
     )
 
     # Usage measured before a compaction priced context the summary replaced, so it
-    # can only overstate what the next request will carry. Messages retained across
-    # a compaction keep their own place after the summary row, so they still count.
+    # can only overstate what the next request will carry.
     assert provider_prompt_floor_tokens((before, summary)) == 0
-    assert provider_prompt_floor_tokens((summary, before)) == 120_000
+
+
+def test_provider_prompt_floor_ignores_a_replayed_summary_row_at_the_front() -> None:
+    """Replay puts a compaction summary *in front of* the responses it replaced.
+
+    Breaking the scan at the summary row made the responses behind it count again, so
+    the floor kept pricing a prefix the compaction had thrown away and could never
+    come back down. In the session this was found in, one compaction took the prompt
+    from 115,209 tokens to 51,476 and every pressure check afterwards still reported
+    115,209: each later trigger was phantom, and one of them paid 56,240 tokens to
+    summarize a context that was not near its window.
+    """
+    kept = AssistantMessage(
+        content="old answer",
+        usage=Usage(input=100_000, cache_read=20_000, total_tokens=120_500),
+        timestamp=100,
+    )
+    summary = UserMessage(
+        content=f"{COMPACTION_SUMMARY_PREFIX}## Goal\nKeep going.",
+        timestamp=200,
+    )
+    after = AssistantMessage(
+        content="post-compaction answer",
+        usage=Usage(input=50_000, cache_read=1_000, total_tokens=51_976),
+        timestamp=300,
+    )
+
+    # Only what the provider measured since the boundary counts as a floor.
+    assert provider_prompt_floor_tokens((summary, kept, after)) == 51_000
+    # Nothing measured since the boundary: no floor, rather than a stale one.
+    assert provider_prompt_floor_tokens((summary, kept)) == 0
+
+
+def test_provider_prompt_floor_uses_the_newest_of_several_summaries() -> None:
+    early = UserMessage(content=f"{COMPACTION_SUMMARY_PREFIX}## Goal\nEarly.", timestamp=100)
+    between = AssistantMessage(
+        content="measured between compactions",
+        usage=Usage(input=90_000, cache_read=0, total_tokens=90_500),
+        timestamp=200,
+    )
+    later = UserMessage(content=f"{COMPACTION_SUMMARY_PREFIX}## Goal\nLater.", timestamp=400)
+
+    assert provider_prompt_floor_tokens((early, between, later)) == 0
 
 
 def test_context_usage_estimate_reports_breakdown(tmp_path: Path) -> None:

@@ -363,7 +363,9 @@ async def test_rpc_compaction_returns_canonical_summary_and_boundary(tmp_path: P
     boundary = response["data"]["firstKeptEntryId"]
     assert response["data"]["summary"] == "real summary"
     assert boundary in original_ids
-    assert compaction.replaces_entry_ids == []
+    assert boundary not in compaction.replaces_entry_ids
+    assert set(compaction.replaces_entry_ids) <= set(original_ids)
+    assert compaction.replaces_entry_ids
     assert boundary != compaction.id
     assert compaction.first_kept_entry_id == boundary
     assert compaction.tokens_before == response["data"]["tokensBefore"]

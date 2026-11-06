@@ -193,27 +193,52 @@ def provider_prompt_floor_tokens(messages: tuple[AgentMessage, ...]) -> int:
     needs no tokenizer and cannot drift: it is the number that a provider's own
     "prompt exceeds the context window" rejection is computed from.
 
-    The scan stops at the newest compaction summary. Usage recorded before one
-    describes context that summary replaced, which the next request will not
-    carry, so it can only overstate. Responses that ended in `error` or `aborted`
-    are skipped as well: a rejected request measured a prompt the provider
-    refused, not this context.
+    Only responses dated after the newest compaction summary count. A summary row
+    is *prepended* to the context it replaces, so the entries it folded away are
+    gone while the responses that priced them are still in the list behind it. A
+    number taken from one of those prices a prefix that is no longer sent, and
+    since it is a maximum it never falls back down: the context reads as full for
+    the rest of the session. In the session this was found in, one compaction took
+    the prompt from 115,209 tokens to 51,476, and every pressure check afterwards
+    still reported 115,209 against a threshold of 114,688 — each later trigger was
+    phantom, and each paid for a fresh summarizer call.
+
+    Responses that ended in `error` or `aborted` are skipped as well: a rejected
+    request measured a prompt the provider refused, not this context.
     """
-    for message in reversed(messages):
-        if isinstance(message, UserMessage) and message_text(message).startswith(
-            COMPACTION_SUMMARY_PREFIX
-        ):
-            break
+    boundary = _newest_compaction_boundary(messages)
+    floor = 0
+    for message in messages:
         if not isinstance(message, AssistantMessage) or message.stop_reason in {
             "aborted",
             "error",
         }:
             continue
+        if boundary is not None and message.timestamp <= boundary:
+            continue
         usage = message.usage
         prompt_tokens = usage.input + usage.cache_read + usage.cache_write
         if prompt_tokens > 0:
-            return prompt_tokens
-    return 0
+            floor = prompt_tokens
+    return floor
+
+
+def _newest_compaction_boundary(messages: tuple[AgentMessage, ...]) -> float | None:
+    """Return the time the newest compaction summary removed its prefix, if any.
+
+    Replay stamps a summary row with its entry's own time (`_entry_timestamp_ms` in
+    `tau_agent.session.memory`), so this is when the summarized prefix left the
+    context, not the moment somebody replayed the file.
+    """
+    boundary: float | None = None
+    for message in messages:
+        if (
+            isinstance(message, UserMessage)
+            and message_text(message).startswith(COMPACTION_SUMMARY_PREFIX)
+            and (boundary is None or message.timestamp > boundary)
+        ):
+            boundary = message.timestamp
+    return boundary
 
 
 def _last_applicable_provider_usage(

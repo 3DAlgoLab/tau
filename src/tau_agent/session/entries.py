@@ -74,8 +74,11 @@ class CompactionEntry(BaseSessionEntry):
 
     type: Literal["compaction"] = "compaction"
     summary: str
-    # Legacy Tau sessions stored every replaced id. Keep accepting and replaying
-    # that shape, but omit the empty compatibility field from new JSONL records.
+    # The exact rows this summary replaced. A kept boundary alone cannot describe a
+    # fold that starts inside an older compaction's kept window, because the row it
+    # supersedes sits after that boundary; recording the rows is what stops the two
+    # summaries stacking in the rebuilt context. Sessions written before the field
+    # was filled carry only the boundary and are replayed from the entry tree.
     replaces_entry_ids: list[str] = Field(default_factory=list, exclude_if=lambda ids: not ids)
     first_kept_entry_id: str | None = None
     tokens_before: int | None = None

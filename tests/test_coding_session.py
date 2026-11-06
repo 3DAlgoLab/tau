@@ -2358,7 +2358,12 @@ async def test_persist_after_branch_keeps_state_on_active_branch(
     await session.compact()
     compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
     assert len(compactions) == 1
-    assert compactions[0].replaces_entry_ids == []
+    # The recorded replacement set describes the live branch only: work abandoned by
+    # the branch is not among the rows this summary replaces.
+    assert compactions[0].replaces_entry_ids
+    assert "abandoned" not in compactions[0].replaces_entry_ids
+    assert "abandoned-answer" not in compactions[0].replaces_entry_ids
+    assert compactions[0].first_kept_entry_id not in compactions[0].replaces_entry_ids
     assert compactions[0].first_kept_entry_id in session.state.context_entry_ids
     assert compactions[0].first_kept_entry_id not in {"abandoned", "abandoned-answer"}
     assert "Abandoned" not in provider.calls[1][2][0].content
@@ -4023,7 +4028,9 @@ async def test_session_compact_persists_summary_and_rebuilds_context(
     assert len(compactions) == 1
     assert isinstance(compactions[0], CompactionEntry)
     assert compactions[0].summary == "Generated session summary"
-    assert compactions[0].replaces_entry_ids == []
+    assert compactions[0].replaces_entry_ids == [
+        entry_id for entry_id in message_entries_before[:-1] if entry_id != "abandoned"
+    ]
     assert compactions[0].first_kept_entry_id == message_entries_before[-1]
     assert compactions[0].usage == Usage(
         input=1_000,
@@ -4039,7 +4046,7 @@ async def test_session_compact_persists_summary_and_rebuilds_context(
         for line in storage.path.read_text().splitlines()
         if (payload := json.loads(line))["type"] == "compaction"
     )
-    assert "replaces_entry_ids" not in persisted_payload
+    assert persisted_payload["replaces_entry_ids"] == compactions[0].replaces_entry_ids
     assert persisted_payload["first_kept_entry_id"] == message_entries_before[-1]
     assert leaves == []
     assert entries_after_compact[-1] == compactions[0]
@@ -4053,6 +4060,56 @@ async def test_session_compact_persists_summary_and_rebuilds_context(
             UserMessage(content="Continue."),
         ],
     )
+
+
+@pytest.mark.anyio
+async def test_a_second_compaction_replaces_the_summary_it_folds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fold that starts inside the kept window must retire the summary it covers.
+
+    A kept boundary cannot say which earlier summary a compaction supersedes, because
+    that summary row sits *after* the boundary. Replaying on the boundary alone keeps
+    both: the session this was found in carried a 54,445 character summary in every
+    later request long after a second compaction had replaced it, and then
+    summarized it again. Recording the replaced rows retires the old summary at replay.
+    """
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Session answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second summary")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _events = await _collect_session_events(session.prompt("Explain sessions."))
+
+    _first = await session.compact()
+    _second = await session.compact()
+
+    entries = await storage.read_all()
+    compactions = [entry for entry in entries if entry.type == "compaction"]
+    assert len(compactions) == 2
+    assert compactions[1].replaces_entry_ids == [compactions[0].id]
+
+    # What matters is the context the next request would send, replayed from disk.
+    reloaded = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    rendered = [str(message.content) for message in reloaded.messages]
+    assert sum("summary" in text for text in rendered) == 1
+    assert any("Second summary" in text for text in rendered)
+    assert not any("First summary" in text for text in rendered)
 
 
 @pytest.mark.anyio
@@ -4103,7 +4160,7 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
 
     assert len(compactions) == 1
     assert compactions[0].summary == "Generated automatic summary"
-    assert compactions[0].replaces_entry_ids == []
+    assert compactions[0].replaces_entry_ids
     assert compactions[0].first_kept_entry_id in session.state.context_entry_ids
     assert compactions[0].tokens_before is not None
     assert compactions[0].tokens_before > 0
